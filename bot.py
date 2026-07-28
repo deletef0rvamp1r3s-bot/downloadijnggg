@@ -80,10 +80,50 @@ async def fetch_restricted_video(client, message):
             
             await notification.edit_text("⏳ جاري الإرسال إليك...")
             
+            # --- بداية التعديل الجديد ---
             if target_msg.video:
-                await client.send_video(chat_id="me", video=file_path, caption="✅ تم السحب بنجاح!")
-            else:
-                await client.send_document(chat_id="me", document=file_path, caption="✅ تم السحب بنجاح!")
+                # سحب بيانات الفيديو (المدة، العرض، الطول)
+                duration = target_msg.video.duration or 0
+                width = target_msg.video.width or 0
+                height = target_msg.video.height or 0
+                
+                # سحب الصورة المصغرة (التمبنيل) إن وجدت
+                thumb_path = None
+                if target_msg.video.thumbs:
+                    thumb_path = await client.download_media(target_msg.video.thumbs[0].file_id)
+                
+                # إرسال الفيديو مع بياناته الأصلية لكي لا يتمطط
+                await client.send_video(
+                    chat_id="me", 
+                    video=file_path, 
+                    caption="✅ تم السحب بنجاح!",
+                    duration=duration,
+                    width=width,
+                    height=height,
+                    thumb=thumb_path
+                )
+                
+                # تنظيف الصورة المصغرة بعد الإرسال
+                if thumb_path and os.path.exists(thumb_path):
+                    os.remove(thumb_path)
+                    
+            elif target_msg.document:
+                # سحب الصورة المصغرة للمستندات إن وجدت
+                thumb_path = None
+                if target_msg.document.thumbs:
+                    thumb_path = await client.download_media(target_msg.document.thumbs[0].file_id)
+                    
+                await client.send_document(
+                    chat_id="me", 
+                    document=file_path, 
+                    caption="✅ تم السحب بنجاح!",
+                    thumb=thumb_path
+                )
+                
+                # تنظيف الصورة المصغرة بعد الإرسال
+                if thumb_path and os.path.exists(thumb_path):
+                    os.remove(thumb_path)
+            # --- نهاية التعديل الجديد ---
             
             os.remove(file_path)
             await notification.delete()
