@@ -6,9 +6,6 @@ from pyrogram.types import InputMediaVideo, InputMediaDocument, InputMediaPhoto
 from pyrogram.errors import FloodWait
 from flask import Flask
 import threading
-from dotenv import load_dotenv
-
-load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
