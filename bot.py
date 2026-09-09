@@ -1,136 +1,137 @@
-import logging
 import os
-import asyncio
-from pyrogram import Client, filters
-from pyrogram.types import InputMediaVideo, InputMediaDocument, InputMediaPhoto
-from pyrogram.errors import FloodWait
+import re
+from threading import Thread
 from flask import Flask
-import threading
+from pyrogram import Client, filters
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+web_server = Flask(__name__)
 
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-SESSION_STRING = os.getenv("SESSION_STRING")
-PORT = int(os.getenv("PORT", 8080))
+@web_server.route('/')
+def home():
+    return "Bot is alive and running!"
 
-app = Flask(__name__)
-client = Client(
-    "bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=SESSION_STRING,
-    workers=1,
-    in_memory=True
-)
+def run_web_server():
+    port = int(os.environ.get("PORT", 8080))
+    web_server.run(host="0.0.0.0", port=port)
 
-user_state = {}
+# بياناتك 
+API_ID = 35909411
+API_HASH = "d2e7f09b5aaeaf64904b8afd6b8057c7"
+SESSION_STRING = os.environ.get("SESSION_STRING", "")
 
-@app.route("/health")
-def health():
-    return "OK", 200
+app = Client("my_account", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
 
-@client.on_message(filters.private)
-async def handle_message(_, message):
+@app.on_message(filters.me & filters.regex(r"^https://t\.me/(c/)?(.+)/(\d+)$"))
+async def fetch_restricted_video(client, message):
+    link = message.text
+    match = re.search(r"^https://t\.me/(c/)?(.+)/(\d+)$", link)
+    if not match:
+        return
+        
+    is_private = match.group(1)
+    chat_identifier = match.group(2)
+    msg_id = int(match.group(3))
+    
+    if is_private:
+        chat_id = int(f"-100{chat_identifier}")
+    else:
+        chat_id = chat_identifier
+        
+    notification = await message.reply_text("⏳ جاري جلب المقطع...")
+    
     try:
-        user_id = message.chat.id
-        text = message.text.strip() if message.text else ""
-        
-        logger.info(f"Message from {user_id}: {text}")
-        
-        if text.startswith("https://t.me/"):
-            parts = text.split("/")
+        target_msg = await client.get_messages(chat_id, msg_id)
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "peer_id_invalid" in error_msg or "peer id invalid" in error_msg:
+            await notification.edit_text("⏳ هذه القناة جديدة على ذاكرة البوت.\n🔍 جاري البحث عنها في محادثاتك للتعرف عليها...")
+            
+            found = False
+            count = 0
+            # فحص المحادثات للتعرف على القناة
+            async for dialog in client.get_dialogs():
+                count += 1
+                if count % 50 == 0:
+                    await notification.edit_text(f"🔍 مستمر في البحث... (تم فحص {count} محادثة)")
+                
+                if dialog.chat.id == chat_id:
+                    found = True
+                    break
+            
+            if not found:
+                await notification.edit_text("❌ بحثت في جميع محادثاتك ولم أجد هذه القناة! تأكد أنك منضم إليها.")
+                return
+            
+            await notification.edit_text("✅ تم التعرف على القناة بنجاح! جاري استكمال السحب...")
+            
             try:
-                start_id = int(parts[-1])
-                chat_id_str = parts[-2]
-                
-                if chat_id_str.startswith("c"):
-                    chat_id = -100 * int(chat_id_str[1:])
-                else:
-                    chat_id = int(chat_id_str)
-                
-                user_state[user_id] = {"chat_id": chat_id, "start_id": start_id}
-                await message.reply("Link saved. Send 'done' for single item or end message ID.")
-            except (ValueError, IndexError):
-                await message.reply("Invalid link")
-        
-        elif text.lower() in ["تم", "done"]:
-            if user_id not in user_state:
-                await message.reply("Send link first")
+                target_msg = await client.get_messages(chat_id, msg_id)
+            except Exception as inner_e:
+                await notification.edit_text(f"❌ حدث خطأ بعد التعرف على القناة: {inner_e}")
                 return
-            
-            state = user_state[user_id]
-            await download_and_save(state["chat_id"], state["start_id"], state["start_id"], user_id, message)
-        
-        elif text.isdigit():
-            if user_id not in user_state:
-                await message.reply("Send link first")
-                return
-            
-            state = user_state[user_id]
-            end_id = int(text)
-            await download_and_save(state["chat_id"], state["start_id"], end_id, user_id, message)
-    
-    except Exception as e:
-        logger.error(f"Error: {e}", exc_info=True)
-        await message.reply(f"Error: {str(e)[:100]}")
+        else:
+            await notification.edit_text(f"❌ حدث خطأ غير متوقع: {e}")
+            return
 
-async def download_and_save(chat_id, start_id, end_id, user_id, message):
     try:
-        media_list = []
-        count = 0
-        
-        async for msg in client.get_chat_history(chat_id, limit=end_id - start_id + 1):
-            if msg.message_id < start_id or msg.message_id > end_id:
-                continue
+        if target_msg.video or target_msg.document:
+            await notification.edit_text("⏳ جاري تحميل المقطع من القناة... (قد يستغرق وقتاً حسب الحجم)")
+            file_path = await target_msg.download()
             
-            if msg.video:
-                media_list.append(InputMediaVideo(media=msg.video.file_id, caption=msg.caption or ""))
-                count += 1
-            elif msg.document:
-                media_list.append(InputMediaDocument(media=msg.document.file_id, caption=msg.caption or ""))
-                count += 1
-            elif msg.photo:
-                media_list.append(InputMediaPhoto(media=msg.photo.file_id, caption=msg.caption or ""))
-                count += 1
+            await notification.edit_text("⏳ جاري الإرسال إليك...")
             
-            if len(media_list) >= 10:
-                await client.send_media_group("me", media_list)
-                media_list = []
-                await asyncio.sleep(2)
-        
-        if media_list:
-            await client.send_media_group("me", media_list)
-        
-        await message.reply(f"Saved {count} media to Saved Messages")
-        logger.info(f"Saved {count} media from chat {chat_id}")
-    
-    except FloodWait as fw:
-        logger.warning(f"FloodWait: {fw.value}s")
-        await asyncio.sleep(fw.value)
-        await download_and_save(chat_id, start_id, end_id, user_id, message)
+            # --- بداية التعديل الجديد ---
+            if target_msg.video:
+                # سحب بيانات الفيديو (المدة، العرض، الطول)
+                duration = target_msg.video.duration or 0
+                width = target_msg.video.width or 0
+                height = target_msg.video.height or 0
+                
+                # سحب الصورة المصغرة (التمبنيل) إن وجدت
+                thumb_path = None
+                if target_msg.video.thumbs:
+                    thumb_path = await client.download_media(target_msg.video.thumbs[0].file_id)
+                
+                # إرسال الفيديو مع بياناته الأصلية لكي لا يتمطط
+                await client.send_video(
+                    chat_id="me", 
+                    video=file_path, 
+                    caption="✅ تم السحب بنجاح!",
+                    duration=duration,
+                    width=width,
+                    height=height,
+                    thumb=thumb_path
+                )
+                
+                # تنظيف الصورة المصغرة بعد الإرسال
+                if thumb_path and os.path.exists(thumb_path):
+                    os.remove(thumb_path)
+                    
+            elif target_msg.document:
+                # سحب الصورة المصغرة للمستندات إن وجدت
+                thumb_path = None
+                if target_msg.document.thumbs:
+                    thumb_path = await client.download_media(target_msg.document.thumbs[0].file_id)
+                    
+                await client.send_document(
+                    chat_id="me", 
+                    document=file_path, 
+                    caption="✅ تم السحب بنجاح!",
+                    thumb=thumb_path
+                )
+                
+                # تنظيف الصورة المصغرة بعد الإرسال
+                if thumb_path and os.path.exists(thumb_path):
+                    os.remove(thumb_path)
+            # --- نهاية التعديل الجديد ---
+            
+            os.remove(file_path)
+            await notification.delete()
+        else:
+            await notification.edit_text("❌ الرابط لا يحتوي على مقطع فيديو أو ملف مدعوم.")
     except Exception as e:
-        logger.error(f"Save error: {e}", exc_info=True)
-        await message.reply(f"Error: {str(e)[:100]}")
-
-async def idle_loop():
-    while True:
-        await asyncio.sleep(60)
-
-def run_flask():
-    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
-
-async def main():
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    
-    async with client:
-        logger.info("Bot started")
-        await idle_loop()
+        await notification.edit_text(f"❌ حدث خطأ أثناء التحميل: {e}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    Thread(target=run_web_server).start()
+    app.run()
