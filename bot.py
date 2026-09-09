@@ -14,7 +14,7 @@ from pyrogram.types import (
 
 
 # =========================
-# Logging
+# إعداد Logs
 # =========================
 
 logging.basicConfig(
@@ -26,7 +26,35 @@ logger = logging.getLogger(__name__)
 
 
 # =========================
-# Railway Web Server
+# فحص متغيرات Railway
+# =========================
+
+API_ID_VALUE = os.getenv("API_ID", "").strip()
+API_HASH_VALUE = os.getenv("API_HASH", "").strip()
+SESSION_VALUE = os.getenv("SESSION_STRING", "").strip()
+
+print("API_ID موجود:", bool(API_ID_VALUE))
+print("API_HASH موجود:", bool(API_HASH_VALUE))
+print("SESSION موجود:", bool(SESSION_VALUE))
+print("طول SESSION:", len(SESSION_VALUE))
+
+if not API_ID_VALUE:
+    raise RuntimeError("المتغير API_ID غير موجود في Railway")
+
+if not API_HASH_VALUE:
+    raise RuntimeError("المتغير API_HASH غير موجود في Railway")
+
+if not SESSION_VALUE:
+    raise RuntimeError("المتغير SESSION_STRING غير موجود في Railway")
+
+try:
+    API_ID = int(API_ID_VALUE)
+except ValueError:
+    raise RuntimeError("قيمة API_ID يجب أن تكون رقمًا فقط")
+
+
+# =========================
+# Web Server الخاص بـ Railway
 # =========================
 
 web_server = Flask(__name__)
@@ -38,31 +66,12 @@ def home():
 
 
 def run_web_server():
-    port = int(os.environ.get("PORT", "8080"))
+    port = int(os.getenv("PORT", "8080"))
+
     web_server.run(
         host="0.0.0.0",
         port=port,
         threaded=True
-    )
-
-
-# =========================
-# Environment Variables
-# =========================
-
-try:
-    API_ID = int(os.environ["API_ID"])
-    API_HASH = os.environ["API_HASH"].strip()
-    SESSION_STRING = os.environ["SESSION_STRING"].strip()
-except KeyError as error:
-    raise RuntimeError(
-        f"المتغير التالي غير موجود في Railway Variables: {error}"
-    )
-
-
-if not SESSION_STRING:
-    raise RuntimeError(
-        "SESSION_STRING فارغ. أضفه في Railway Variables."
     )
 
 
@@ -73,41 +82,58 @@ if not SESSION_STRING:
 app = Client(
     name="my_account",
     api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=SESSION_STRING,
+    api_hash=API_HASH_VALUE,
+    session_string=SESSION_VALUE,
     in_memory=True
 )
 
 
-# حالة المستخدم أثناء انتظار رقم النهاية
+# حفظ حالة الطلبات
 user_state = {}
 
 
-# رابط عام:
+# روابط عامة:
 # https://t.me/channel/123
 #
-# رابط خاص:
+# روابط خاصة:
 # https://t.me/c/123456789/123
 LINK_PATTERN = r"^https://t\.me/(c/)?([^/\s]+)/(\d+)$"
 
 
 # =========================
-# Startup
+# عند بدء تشغيل الحساب
 # =========================
 
-@app.on_message(filters.chat("me") & filters.command("status"))
+@app.on_message(
+    filters.chat("me") &
+    filters.command("status")
+)
 async def status_command(client, message):
     me = await client.get_me()
 
     await message.reply_text(
-        "✅ Userbot يعمل\n"
-        f"👤 الحساب: {me.first_name}\n"
-        f"🆔 ID: {me.id}"
+        "✅ Userbot يعمل\n\n"
+        f"👤 الاسم: {me.first_name}\n"
+        f"🆔 ID: {me.id}\n"
+        f"📛 Username: @{me.username or 'لا يوجد'}"
     )
 
 
+# اختبار استقبال الرسائل من Saved Messages
+@app.on_message(filters.chat("me"))
+async def debug_saved_messages(client, message):
+    logger.info(
+        "رسالة وصلت إلى Saved Messages | id=%s | text=%r",
+        message.id,
+        message.text
+    )
+
+    if message.text and message.text.strip() == "/test":
+        await message.reply_text("✅ الجلسة تعمل بشكل صحيح")
+
+
 # =========================
-# استقبال الرابط في Saved Messages
+# استقبال رابط تيليجرام
 # =========================
 
 @app.on_message(
@@ -115,7 +141,7 @@ async def status_command(client, message):
     filters.text &
     filters.regex(LINK_PATTERN)
 )
-async def fetch_restricted_video(client, message):
+async def receive_link(client, message):
     try:
         link = message.text.strip()
 
@@ -124,7 +150,7 @@ async def fetch_restricted_video(client, message):
         match = re.match(LINK_PATTERN, link)
 
         if not match:
-            await message.reply_text("❌ الرابط غير صحيح.")
+            await message.reply_text("❌ الرابط غير صحيح")
             return
 
         is_private = match.group(1)
@@ -143,21 +169,22 @@ async def fetch_restricted_video(client, message):
 
         await message.reply_text(
             "خيارات الحفظ:\n\n"
-            "1️⃣ لحفظ هذا المقطع فقط، أرسل:\n"
-            "`تم`\n\n"
-            "2️⃣ لحفظ مجموعة مقاطع، أرسل رقم المقطع الأخير، مثال:\n"
-            "`3500`"
+            "1️⃣ لحفظ هذا المقطع فقط أرسل:\n"
+            "تم\n\n"
+            "2️⃣ لحفظ مجموعة مقاطع أرسل رقم المقطع الأخير، مثال:\n"
+            "3500"
         )
 
     except Exception as error:
-        logger.exception("حدث خطأ أثناء قراءة الرابط")
+        logger.exception("خطأ أثناء قراءة الرابط")
+
         await message.reply_text(
             f"❌ حدث خطأ أثناء قراءة الرابط:\n{error}"
         )
 
 
 # =========================
-# استقبال اختيار المستخدم
+# استقبال كلمة تم أو رقم النهاية
 # =========================
 
 @app.on_message(
@@ -195,7 +222,7 @@ async def process_choice(client, message):
 
         user_state.pop(chat_id, None)
 
-        await start_downloading(
+        await download_messages(
             client=client,
             message=message,
             chat_id=state["chat_id"],
@@ -204,17 +231,18 @@ async def process_choice(client, message):
         )
 
     except Exception as error:
-        logger.exception("حدث خطأ في اختيار المستخدم")
+        logger.exception("خطأ أثناء معالجة الاختيار")
+
         await message.reply_text(
             f"❌ حدث خطأ:\n{error}"
         )
 
 
 # =========================
-# تحميل وإرسال الملفات
+# تحميل الرسائل
 # =========================
 
-async def start_downloading(
+async def download_messages(
     client,
     message,
     chat_id,
@@ -222,21 +250,16 @@ async def start_downloading(
     end_id
 ):
     notification = await message.reply_text(
-        f"⏳ جاري تجهيز التحميل من {start_id} إلى {end_id}..."
+        f"⏳ جاري التحميل من {start_id} إلى {end_id}..."
     )
 
-    # اختبار الوصول إلى المحادثة
-    try:
-        test_message = await client.get_messages(
-            chat_id,
-            start_id
-        )
+    success_count = 0
+    failed_count = 0
+    processed_groups = set()
 
-        if not test_message or test_message.empty:
-            logger.warning(
-                "الرسالة الأولى غير موجودة: %s",
-                start_id
-            )
+    # التأكد من الوصول للمحادثة
+    try:
+        await client.get_messages(chat_id, start_id)
 
     except Exception as error:
         logger.exception("تعذر الوصول إلى المحادثة")
@@ -248,8 +271,8 @@ async def start_downloading(
             "peer id invalid" in error_text
         ):
             await notification.edit_text(
-                "⏳ القناة غير معروفة للحساب حاليًا.\n"
-                "🔍 جاري البحث عنها في محادثات الحساب..."
+                "⏳ القناة غير معروفة للحساب.\n"
+                "🔍 جاري البحث عنها في المحادثات..."
             )
 
             found = False
@@ -272,16 +295,16 @@ async def start_downloading(
                         found = True
                         break
 
-            except Exception as dialog_error:
+            except Exception as search_error:
                 await notification.edit_text(
-                    f"❌ حدث خطأ أثناء البحث:\n{dialog_error}"
+                    f"❌ حدث خطأ أثناء البحث:\n{search_error}"
                 )
                 return
 
             if not found:
                 await notification.edit_text(
                     "❌ لم أجد هذه القناة في محادثات الحساب.\n"
-                    "تأكد أنك منضم للقناة وأن الرابط صحيح."
+                    "تأكد أنك منضم إليها."
                 )
                 return
 
@@ -292,25 +315,18 @@ async def start_downloading(
 
         else:
             await notification.edit_text(
-                f"❌ تعذر الوصول إلى المحادثة:\n{error}"
+                f"❌ لا يمكن الوصول إلى القناة:\n{error}"
             )
             return
 
-    processed_groups = set()
-    success_count = 0
-    failed_count = 0
-
+    # بدء معالجة الرسائل
     for current_id in range(start_id, end_id + 1):
         try:
-            # تحديث رسالة الحالة كل 3 رسائل تقريبًا
-            if (
-                current_id == start_id or
-                current_id % 3 == 0
-            ):
+            if current_id == start_id or current_id % 3 == 0:
                 try:
                     await notification.edit_text(
-                        f"⏳ جاري معالجة المقطع {current_id} "
-                        f"من أصل {end_id}\n"
+                        f"⏳ جاري معالجة الرسالة {current_id} "
+                        f"من أصل {end_id}\n\n"
                         f"✅ تم حفظ: {success_count}\n"
                         f"❌ فشل: {failed_count}"
                     )
@@ -325,17 +341,15 @@ async def start_downloading(
             if not msg or msg.empty:
                 continue
 
-            has_media = (
+            if not (
                 msg.video or
                 msg.document or
                 msg.photo
-            )
-
-            if not has_media:
+            ):
                 continue
 
             # =========================
-            # ألبوم / Media Group
+            # ألبوم
             # =========================
 
             if msg.media_group_id:
@@ -351,64 +365,64 @@ async def start_downloading(
                     current_id
                 )
 
-                media_files = []
-                downloaded_paths = []
+                media_list = []
+                downloaded_files = []
 
-                for group_message in media_group:
+                for item in media_group:
                     if not (
-                        group_message.video or
-                        group_message.document or
-                        group_message.photo
+                        item.video or
+                        item.document or
+                        item.photo
                     ):
                         continue
 
-                    file_path = await group_message.download()
+                    file_path = await item.download()
 
                     if not file_path:
                         continue
 
-                    downloaded_paths.append(file_path)
-                    caption = group_message.caption or ""
+                    downloaded_files.append(file_path)
 
-                    if group_message.video:
-                        media_files.append(
+                    caption = item.caption or ""
+
+                    if item.video:
+                        media_list.append(
                             InputMediaVideo(
                                 media=file_path,
                                 caption=caption
                             )
                         )
 
-                    elif group_message.document:
-                        media_files.append(
+                    elif item.document:
+                        media_list.append(
                             InputMediaDocument(
                                 media=file_path,
                                 caption=caption
                             )
                         )
 
-                    elif group_message.photo:
-                        media_files.append(
+                    elif item.photo:
+                        media_list.append(
                             InputMediaPhoto(
                                 media=file_path,
                                 caption=caption
                             )
                         )
 
-                if media_files:
-                    # Telegram يسمح بحد أقصى 10 عناصر في المجموعة
-                    for i in range(0, len(media_files), 10):
-                        chunk = media_files[i:i + 10]
+                if media_list:
+                    # الحد الأقصى للمجموعة الواحدة 10 ملفات
+                    for position in range(0, len(media_list), 10):
+                        part = media_list[position:position + 10]
 
                         await client.send_media_group(
                             chat_id="me",
-                            media=chunk
+                            media=part
                         )
 
-                        success_count += len(chunk)
+                        success_count += len(part)
 
-                # حذف الملفات المؤقتة
-                for file_path in downloaded_paths:
-                    remove_file(file_path)
+                for file_path in downloaded_files:
+                    delete_file(file_path)
 
             # =========================
             # فيديو منفرد
@@ -441,11 +455,11 @@ async def start_downloading(
                     success_count += 1
 
                 finally:
-                    remove_file(file_path)
-                    remove_file(thumb_path)
+                    delete_file(file_path)
+                    delete_file(thumb_path)
 
             # =========================
-            # ملف / Document
+            # ملف
             # =========================
 
             elif msg.document:
@@ -472,8 +486,8 @@ async def start_downloading(
                     success_count += 1
 
                 finally:
-                    remove_file(file_path)
-                    remove_file(thumb_path)
+                    delete_file(file_path)
+                    delete_file(thumb_path)
 
             # =========================
             # صورة
@@ -495,20 +509,18 @@ async def start_downloading(
                     success_count += 1
 
                 finally:
-                    remove_file(file_path)
+                    delete_file(file_path)
 
-            # راحة بسيطة لتقليل FloodWait
             await asyncio.sleep(2)
 
         except Exception as error:
             failed_count += 1
 
             logger.exception(
-                "فشل تحميل الرسالة رقم %s",
+                "فشل التعامل مع الرسالة رقم %s",
                 current_id
             )
 
-            # يكمل بقية الرسائل حتى لو فشلت رسالة
             continue
 
     try:
@@ -525,7 +537,7 @@ async def start_downloading(
 # حذف الملفات المؤقتة
 # =========================
 
-def remove_file(file_path):
+def delete_file(file_path):
     if not file_path:
         return
 
@@ -547,16 +559,19 @@ def remove_file(file_path):
 if __name__ == "__main__":
     logger.info("تشغيل Web Server...")
 
-    web_thread = Thread(
+    Thread(
         target=run_web_server,
         daemon=True
-    )
-    web_thread.start()
+    ).start()
 
     logger.info("تشغيل Pyrogram...")
 
     try:
         app.run()
-    except Exception:
-        logger.exception("توقف البرنامج بسبب خطأ")
+
+    except Exception as error:
+        logger.exception(
+            "توقف Pyrogram بسبب الخطأ التالي: %s",
+            error
+        )
         raise
