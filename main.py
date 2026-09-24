@@ -4,7 +4,7 @@ import asyncio
 from threading import Thread
 from flask import Flask
 from pyrogram import Client, filters
-from pyrogram.types import InputMediaVideo, InputMediaDocument, InputMediaPhoto
+from pyrogram.types import InputMediaVideo, InputMediaDocument, InputMediaPhoto, InputMediaAnimation, InputMediaAudio
 from pyrogram.errors import FloodWait
 
 web_server = Flask(__name__)
@@ -21,7 +21,6 @@ API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 SESSION_STRING = os.environ.get("SESSION_STRING", "")
 
-# تمت إضافة sleep_threshold لامتصاص الحظر المؤقت تلقائياً بدون تخطي أي مقطع
 app = Client("my_account", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING, sleep_threshold=60)
 
 user_states = {}
@@ -49,9 +48,7 @@ async def fetch_restricted_video(client, message):
     
     await message.reply_text(
         f"🔗 تم التقاط الرابط للرسالة رقم `{msg_id}`.\n\n"
-        "💡 **كيف تريد السحب؟**\n"
-        "1️⃣ لسحب هذا المقطع **فقط** ⬅️ أرسل كلمة: `فقط`\n"
-        "2️⃣ لسحب **مجموعة مقاطع** ⬅️ أرسل رقم الرسالة النهائية (مثال: `6850`)"
+        "💡 أرسل `فقط` لسحب هذا المقطع، أو أرسل **رقم الرسالة النهائية** لسحب مجموعة."
     )
 
 @app.on_message(filters.me & filters.text & ~filters.regex(r"^https://t\.me/"))
@@ -71,7 +68,7 @@ async def handle_download_choice(client, message):
     elif text.isdigit():
         end_id = int(text)
         if end_id <= start_id:
-            await message.reply_text("❌ يجب أن يكون الرقم النهائي أكبر من رقم البداية. أعد إرسال الرقم بشكل صحيح.")
+            await message.reply_text("❌ الرقم النهائي يجب أن يكون أكبر من رقم البداية.")
             return
     else:
         return
@@ -80,7 +77,6 @@ async def handle_download_choice(client, message):
     
     notification = await message.reply_text("⏳ جاري التحقق من القناة...")
     
-    # --- رجعنا لطريقتك الأصلية والذكية في التعرف على القنوات المقفلة ---
     try:
         await client.get_messages(chat_id, start_id)
     except Exception as e:
@@ -107,22 +103,23 @@ async def handle_download_choice(client, message):
     for current_id in range(start_id, end_id + 1):
         retry_count = 0
         
-        # --- نظام المحاولة (السر لمنع تخطي المقاطع) ---
         while retry_count < 3: 
             files_to_delete = []
             file_path = None
             thumb_path = None
             
             try:
-                if current_id % 5 == 0 and current_id != start_id:
+                if current_id % 2 == 0: # تحديث الرسالة بشكل أسرع لتعرف أين وصل
                     try: await notification.edit_text(f"⏳ جاري المعالجة... (وصلنا للرسالة {current_id} من أصل {end_id})")
                     except: pass
                     
                 msg = await client.get_messages(chat_id, current_id)
-                if msg.empty:
-                    break # نخرج من حلقة المحاولة لأن الرسالة محذوفة فعلاً
+                
+                # إذا كانت الرسالة محذوفة أو نصية فقط (لا تحتوي على ميديا)، نتخطاها
+                if msg.empty or not msg.media:
+                    break 
                     
-                # --- 1. معالجة الألبومات المقفلة ---
+                # --- 1. معالجة الألبومات (Media Group) ---
                 if msg.media_group_id:
                     if msg.media_group_id in processed_groups:
                         break 
@@ -132,7 +129,7 @@ async def handle_download_choice(client, message):
                     media_to_send = []
                     
                     for m in media_group:
-                        if m.video or m.document or m.photo:
+                        if m.media:
                             file_path = await m.download()
                             if not file_path: continue
                             files_to_delete.append(file_path)
@@ -145,12 +142,17 @@ async def handle_download_choice(client, message):
                                 
                             if thumb_path: files_to_delete.append(thumb_path)
                                 
+                            # تصنيف الميديا داخل الألبوم (بما فيها الـ GIF)
                             if m.video:
                                 media_to_send.append(InputMediaVideo(media=file_path, duration=m.video.duration or 0, width=m.video.width or 0, height=m.video.height or 0, thumb=thumb_path))
+                            elif m.animation:
+                                media_to_send.append(InputMediaAnimation(media=file_path))
                             elif m.document:
                                 media_to_send.append(InputMediaDocument(media=file_path, thumb=thumb_path))
                             elif m.photo:
                                 media_to_send.append(InputMediaPhoto(media=file_path))
+                            elif m.audio:
+                                media_to_send.append(InputMediaAudio(media=file_path))
                                 
                     if media_to_send:
                         await client.send_media_group("me", media_to_send)
@@ -159,9 +161,9 @@ async def handle_download_choice(client, message):
                     for f in files_to_delete:
                         if f and os.path.exists(f): os.remove(f)
                         
-                # --- 2. معالجة الرسائل الفردية المقفلة ---
+                # --- 2. معالجة الرسائل الفردية (فيديو، صورة، GIF، صوت، ملف، ملصق) ---
                 else:
-                    if msg.video or msg.document or msg.photo:
+                    if msg.media:
                         file_path = await msg.download()
                         if not file_path: break
                         
@@ -171,8 +173,17 @@ async def handle_download_choice(client, message):
                         elif msg.document and getattr(msg.document, "thumbs", None):
                             thumb_path = await client.download_media(msg.document.thumbs[0].file_id)
                             
+                        # إرسال الميديا بناءً على نوعها
                         if msg.video:
                             await client.send_video("me", file_path, duration=msg.video.duration or 0, width=msg.video.width or 0, height=msg.video.height or 0, thumb=thumb_path)
+                        elif msg.animation:
+                            await client.send_animation("me", file_path)
+                        elif msg.sticker:
+                            await client.send_sticker("me", file_path)
+                        elif msg.voice:
+                            await client.send_voice("me", file_path)
+                        elif msg.audio:
+                            await client.send_audio("me", file_path)
                         elif msg.document:
                             await client.send_document("me", file_path, thumb=thumb_path)
                         elif msg.photo:
@@ -183,16 +194,14 @@ async def handle_download_choice(client, message):
                         if file_path and os.path.exists(file_path): os.remove(file_path)
                         if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
                         
-                # إذا وصلنا هنا معناه العملية تمت بنجاح للمقطع، فنكسر حلقة المحاولة (while)
                 break
                 
             except FloodWait as e:
-                print(f"⚠️ حظر مؤقت لـ {e.value} ثانية... جاري الانتظار لإعادة المحاولة.")
+                print(f"⚠️ حظر مؤقت لـ {e.value} ثانية...")
                 await asyncio.sleep(e.value + 2)
                 retry_count += 1
             except Exception as inner_e:
                 print(f"❌ خطأ في الرسالة {current_id}: {inner_e}")
-                # تنظيف الملفات إذا فشل الرفع لكي لا تمتلىء المساحة
                 for f in files_to_delete:
                     if f and os.path.exists(f): os.remove(f)
                 if file_path and os.path.exists(file_path): os.remove(file_path)
