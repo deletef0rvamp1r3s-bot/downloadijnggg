@@ -38,7 +38,7 @@ TIME_HARD_SEC = 29 * 60
 
 STRONG_COUNT = 40
 FLICK_COUNT = 3
-GHOST_COUNT = 4
+GHOST_COUNT = 2
 MAX_QUEUE = 6
 
 HALO_STRENGTH = 0.20
@@ -170,7 +170,7 @@ class PipeEncoder:
                 "-pix_fmt", "yuv420p", "-profile:v", "high",
                 "-vf", f"setsar={sar_str}",
                 "-tune", "film",
-                "-x264-params", "aq-mode=3:aq-strength=0.9:ref=2:me=dia:subme=2:trellis=1"]
+                "-x264-params", "aq-mode=3:aq-strength=0.9:ref=2:me=hex:subme=3:trellis=1"]
         if maxrate:
             cmd += ["-maxrate", maxrate, "-bufsize", str(int(maxrate.replace("M", "")) * 2) + "M"]
         if audio_src and os.path.exists(audio_src):
@@ -212,14 +212,12 @@ class FloatingWatermark:
         self.total_frames = info["total"]
         self.src_bitrate = info["bitrate"]
 
-        # ✅✅✅ الإصلاح الجذري للسترتش: الاتجاه يُقاس من محتوى أول فريم، مو من بيانات الملف
         ok, first = self.cap.read()
         if not ok:
             raise ValueError("❌ ما قدرت أقرأ أول فريم")
         fh, fw = first.shape[:2]
         dw, dh = info["true_w"], info["true_h"]
         self._auto_rotated = False
-        # إذا الـ decoder دوّر الفريمات من نفسه (بيانات كاذبة) → نلغي تدويرنا
         if self.rotation != 0 and abs((fw / max(1, fh)) - (dw / max(1, dh))) < 0.05:
             self._auto_rotated = True
             self.rotation = 0
@@ -231,12 +229,11 @@ class FloatingWatermark:
         self.width, self.height = tw, th
         self.need_resize = abs(sar - 1.0) > 0.01
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        # ✅✅✅ نهاية الإصلاح
 
         br_m = self.src_bitrate / 1_000_000 if self.src_bitrate else 0
         cap_m = max(6.0, min(12.0, br_m * 2.2)) if br_m > 0 else 8.0
         self.maxrate = f"{cap_m:.0f}M"
-        print(f"🎞 src={self.src_w}x{src_h if False else self.src_h} rot={self.rotation} auto={self._auto_rotated} → {self.width}x{self.height} @ {self.fps:.2f} maxrate={self.maxrate}")
+        print(f"🎞 src={self.src_w}x{self.src_h} rot={self.rotation} auto={self._auto_rotated} → {self.width}x{self.height} @ {self.fps:.2f} maxrate={self.maxrate}")
         self.enc = PipeEncoder(self.width, self.height, self.fps, output_path,
                                audio_src, "1:1", ENCODE_CRF, ENCODE_PRESET, self.maxrate)
         self.text_variants = ["Tel:@vamp1r3s", "@vamp1r3s", "t.me/vamp1r3s"]
@@ -389,25 +386,30 @@ class FloatingWatermark:
         self._sprite_cache[key] = sprite
         return sprite
 
-    def _get_halo(self, text, font_size, bold=False):
-        key = (text, int(font_size), bool(bold))
+    def _get_halo(self, text, font_size, bold=False, halo_color=None, halo_strength=None,
+                  halo_sigma=None, halo_dilate=None):
+        hc = HALO_COLOR if halo_color is None else halo_color
+        hs = HALO_STRENGTH if halo_strength is None else halo_strength
+        sg = HALO_SIGMA if halo_sigma is None else halo_sigma
+        dl = HALO_DILATE if halo_dilate is None else halo_dilate
+        key = (text, int(font_size), bool(bold), hc, hs, sg, dl)
         if key in self._halo_cache:
             return self._halo_cache[key]
         sprite = self._make_sprite(text, font_size, bold)
         if sprite is None:
             self._halo_cache[key] = (None, 0)
             return None, 0
-        m = int(3 * HALO_SIGMA) + HALO_DILATE + 2
+        m = int(3 * sg) + dl + 2
         a = sprite[:, :, 3]
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (HALO_DILATE * 2 + 1, HALO_DILATE * 2 + 1))
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dl * 2 + 1, dl * 2 + 1))
         a = cv2.dilate(a, k, iterations=1)
-        a = cv2.GaussianBlur(a, (0, 0), HALO_SIGMA)
+        a = cv2.GaussianBlur(a, (0, 0), sg)
         H, W = a.shape[:2]
         canvas = np.zeros((H + 2 * m, W + 2 * m), dtype=np.float32)
         canvas[m:m + H, m:m + W] = a.astype(np.float32)
         halo = np.zeros((H + 2 * m, W + 2 * m, 4), dtype=np.uint8)
-        halo[:, :, 0] = HALO_COLOR; halo[:, :, 1] = HALO_COLOR; halo[:, :, 2] = HALO_COLOR
-        halo[:, :, 3] = np.clip(canvas * HALO_STRENGTH, 0, 255).astype(np.uint8)
+        halo[:, :, 0] = hc; halo[:, :, 1] = hc; halo[:, :, 2] = hc
+        halo[:, :, 3] = np.clip(canvas * hs, 0, 255).astype(np.uint8)
         if len(self._halo_cache) > 60:
             self._halo_cache.clear()
         self._halo_cache[key] = (halo, m)
@@ -504,7 +506,7 @@ class FloatingWatermark:
         x = max(2, min(x, self.width - est_w - 2)); y = max(2, min(y, self.height - est_h - 2))
         life = max(40, int(random.uniform(6, 10) * self.fps))
         return {"x": x, "y": y, "vy_ps": random.uniform(60, 120), "font_size": size,
-                "base_alpha": random.uniform(0.030, 0.055), "life": life,
+                "base_alpha": random.uniform(0.020, 0.035), "life": life,
                 "age": random.randint(0, max(1, int(0.5 * self.fps))),
                 "fade_in": max(8, int(self.fps)), "fade_out": max(8, int(1.5 * self.fps)),
                 "bind_gain": random.uniform(3.5, 5.0), "bind_amod": random.uniform(0.20, 0.35),
@@ -596,7 +598,7 @@ class FloatingWatermark:
         if prof < 0.30:
             op_mid, op_amp = random.uniform(0.35, 0.50), random.uniform(0.08, 0.14)
         elif prof < 0.60:
-            op_mid, op_amp = 1.0, 0.0
+            op_mid, op_amp = 0.60, 0.0
             is_opaque = True
             fx_nyq = random.uniform(14.0, 22.0)
             fx_bayer = random.uniform(16.0, 24.0)
@@ -606,7 +608,7 @@ class FloatingWatermark:
             pz_rot_amp = math.radians(random.uniform(1.2, 2.0))
             pz_gam_amp = random.uniform(0.12, 0.18)
         else:
-            op_mid, op_amp = random.uniform(0.30, 0.60), random.uniform(0.08, 0.18)
+            op_mid, op_amp = random.uniform(0.30, 0.55), random.uniform(0.08, 0.16)
             fx_nyq = random.uniform(15.0, 24.0)
             fx_bayer = random.uniform(18.0, 26.0)
             fx_echo = random.uniform(0.50, 0.70)
@@ -863,7 +865,7 @@ class FloatingWatermark:
             "fx_erode_freq": random.uniform(0.08, 0.15),
             "fx_nyq": random.uniform(8.0, 12.0), "fx_bayer": random.uniform(10.0, 14.0),
             "fx_echo": random.uniform(0.28, 0.36), "fx_refl": random.uniform(30.0, 40.0),
-            "bind_gain": random.uniform(6.0, 8.0), "bind_amod": random.uniform(0.40, 0.60),
+            "bind_gain": 2.5, "bind_amod": 0.20,
             "fx_grad_dir": random.choice([0, 1, 2]), "fx_grad_strength": random.uniform(0.20, 0.40),
             "fx_refl_strength": random.uniform(0.35, 0.50), "fx_refl_scale": random.uniform(0.5, 0.7),
             "fx_refl_gap": random.uniform(2, 6),
@@ -902,7 +904,8 @@ class FloatingWatermark:
         self.vip["age"] += 1
         self.vip["t"] += dt
         t = self.vip["t"]
-        alpha = 0.80 + 0.015 * math.sin(t * 0.4)
+        # ✅ أسود، شفاف شوي، أغمق وأوضح من الكل
+        alpha = 0.78 + 0.01 * math.sin(t * 0.4)
         fade_f = max(10, int(0.8 * self.fps))
         if self.vip["age"] < fade_f:
             alpha *= self.vip["age"] / fade_f
@@ -918,8 +921,10 @@ class FloatingWatermark:
         sprite = self._adaptive_bind(sprite, self._frame_detail, self._frame_edges,
                                      self._frame_texture, x, y,
                                      self.vip_fx["bind_gain"], self.vip_fx["bind_amod"])
-        sprite = self._apply_edge_camouflage(sprite, self._frame_edges, self._frame_texture, x, y)
-        halo, hm = self._get_halo(self.vip_text, self.vip_font_size, bold=True)
+        # ✅ هالة داكنة خفيفة توضحه بدون تغبيش
+        halo, hm = self._get_halo(self.vip_text, self.vip_font_size, bold=True,
+                                  halo_color=25, halo_strength=0.30,
+                                  halo_sigma=3.0, halo_dilate=2)
         if halo is not None:
             self._blend_sprite(frame, halo, x - hm + 1, y - hm + 2, alpha)
         self._blend_sprite(frame, sprite, x, y, alpha)
@@ -960,7 +965,6 @@ class FloatingWatermark:
                 frame[y0:y1, x0:x1].astype(np.float32) + add[:, :, None], 0, 255).astype(np.uint8)
         return frame
 
-    # ✅ تدوير بيانات الميتاداتا فقط (بدون تخمين)
     def _rotate_meta(self, frame):
         if self.rotation in (90, -270):
             return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
@@ -970,7 +974,6 @@ class FloatingWatermark:
             return cv2.rotate(frame, cv2.ROTATE_180)
         return frame
 
-    # ✅ شبكة أمان أخيرة: إذا نسبة الأبعاد ما طابقت الهدف لأي سبب → صححها بدون سترتش
     def _apply_rotation(self, frame):
         frame = self._rotate_meta(frame)
         h, w = frame.shape[:2]
@@ -991,9 +994,13 @@ class FloatingWatermark:
         if frame.shape[1] != self.width or frame.shape[0] != self.height:
             frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
         out = frame
+        # ✅ Sharpening خفيف = مقطع واضح بدون تغبيش
+        blur_s = cv2.GaussianBlur(out, (0, 0), 1.1)
+        out = np.clip(out.astype(np.float32) * 1.32 - blur_s.astype(np.float32) * 0.32,
+                      0, 255).astype(np.uint8)
         t = frame_num / self.fps
         if self._frame_detail is None or (frame_num - self._maps_frame) >= 2:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
             self._frame_detail = gray.astype(np.float32) - cv2.blur(gray, (5, 5)).astype(np.float32)
             self._frame_edges = cv2.Canny(gray, 50, 150).astype(np.float32)
             blur_small = cv2.GaussianBlur(gray, (3, 3), 0).astype(np.float32)
@@ -1017,10 +1024,8 @@ class FloatingWatermark:
             else:
                 wave = math.sin(2 * math.pi * t / wm["op_period"] + wm["op_phase"])
                 alpha = fade * (wm["op_mid"] + wm["op_amp"] * wave)
-            if wm.get("is_opaque", False):
-                alpha = max(0.0, min(1.0, alpha))
-            else:
-                alpha = max(0.25, min(0.80, alpha))
+            # ✅ سقف 60% = كل النصوص تحت غمقان الـ VIP
+            alpha = max(0.25, min(0.60, alpha))
             if wm["y"] < self.top_fade_margin:
                 fade_top = max(0.0, wm["y"] / self.top_fade_margin)
                 alpha *= fade_top
@@ -1037,10 +1042,7 @@ class FloatingWatermark:
             sprite = self._adaptive_bind(sprite, self._frame_detail, self._frame_edges,
                                          self._frame_texture, x, y, wm["bind_gain"], wm["bind_amod"])
             sprite = self._apply_edge_camouflage(sprite, self._frame_edges, self._frame_texture, x, y)
-            halo, hm = self._get_halo(txt, wm["font_size"])
-            if halo is not None:
-                hp = 1.0 + HALO_PULSE_AMP * math.sin(t * HALO_PULSE_FREQ * 2 * math.pi + wm.get("fx_phase", 0))
-                self._blend_sprite(out, halo, x - hm + 1, y - hm + 2, alpha * hp)
+            # ✅ بدون هالة رمادية = بدون تغبيش
             if wm.get("blend") == "overlay":
                 self._blend_sprite_overlay(out, sprite, x, y, alpha)
             else:
@@ -1176,9 +1178,10 @@ async def process_job(job):
         job["stage"] = "upload"
         await message.reply_video(out, caption=(
             "✓ تمت إضافة الحقوق 🎬\n\n"
-            "👁 شكل نظيف مريح للعين\n"
-            "📐 أبعاد مأخوذة من محتوى الفيديو نفسه = مستحيل سترتش\n"
-            "🛡️ حماية خفية ضد dewatermark.ai\n\n"
+            "🖤 Telegram:@vamp1r3s أسود واضح أغمق من الكل\n"
+            "👁 مقطع واضح بدون تغبيش (Sharpening + بدون هالات)\n"
+            "🛡️ حماية جباره ضد dewatermark.ai\n"
+            "📐 بدون سترتش\n\n"
             f"📐 {w.width}x{w.height} | rot {w.rotation}°\n"
             f"🎞 CRF {ENCODE_CRF} | maxrate {w.maxrate}\n"
             f"⏱ المعالجة: {fmt_time(elapsed)}"))
@@ -1216,10 +1219,10 @@ async def worker():
 @app.on_message(filters.command("start"))
 async def start(c, m):
     await m.reply("👋 هلا! 🎬\n\nأرسل فيديو وأضيف الحقوق:\n\n"
-                  "📐 أبعاد من محتوى الفيديو = مستحيل سترتش\n"
-                  "👁 شكل نظيف مريح للعين\n"
-                  "🛡️ حماية خفية ضد dewatermark.ai\n"
-                  "🚀 سريع | 💾 CRF 18")
+                  "🖤 Telegram:@vamp1r3s أسود واضح أغمق من الكل\n"
+                  "👁 مقطع واضح بدون تغبيش\n"
+                  "🛡️ حماية جباره ضد dewatermark.ai\n"
+                  "📐 بدون سترتش | 🚀 سريع")
 
 
 @app.on_message(filters.video)
@@ -1245,7 +1248,7 @@ async def status(c, m):
 async def main():
     print("🤖 تشغيل البوت...")
     await app.start()
-    print("✓ البوت شغال | أبعاد من المحتوى = صفر سترتش")
+    print("✓ البوت شغال | VIP أسود واضح + مقطع صافي + حماية جباره")
     asyncio.create_task(worker())
     try:
         from pyrogram import idle
