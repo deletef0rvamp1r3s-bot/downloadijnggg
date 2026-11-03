@@ -206,37 +206,30 @@ class FloatingWatermark:
             raise ValueError("❌ ما قدرت أفتح الفيديو")
         info = extract_info(probe_video(video_path), self.cap)
         self.src_w, self.src_h = info["src_w"], info["src_h"]
-        self.rotation = info["rotation"]
-        self.sar_val = info["sar_val"]
         self.fps = info["fps"] if info["fps"] > 0 else 30.0
         self.total_frames = info["total"]
         self.src_bitrate = info["bitrate"]
 
+        # ✅✅✅ الاتجاه والأبعاد من محتوى أول فريم نفسه — بدون SAR وبدون تخمين
         ok, first = self.cap.read()
         if not ok:
             raise ValueError("❌ ما قدرت أقرأ أول فريم")
+        disp_aspect = info["true_w"] / max(1, info["true_h"])
+        self.frame_rot = self._pick_orientation(first, disp_aspect, info["rotation"])
+        first = self._rot90(first, self.frame_rot)
         fh, fw = first.shape[:2]
-        dw, dh = info["true_w"], info["true_h"]
-        self._auto_rotated = False
-        if self.rotation != 0 and abs((fw / max(1, fh)) - (dw / max(1, dh))) < 0.05:
-            self._auto_rotated = True
-            self.rotation = 0
-        first = self._rotate_meta(first)
-        fh, fw = first.shape[:2]
-        sar = self.sar_val if (not self._auto_rotated and abs(self.sar_val - 1.0) > 0.01) else 1.0
-        tw = int(round(fw * sar)); th = fh
-        tw += tw % 2; th += th % 2
-        self.width, self.height = tw, th
-        self.need_resize = abs(sar - 1.0) > 0.01
+        self.width = fw + fw % 2
+        self.height = fh + fh % 2
+        self.rotation = self.frame_rot
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        # ✅✅✅ نهاية الإصلاح: الترميز = أبعاد المحتوى بالضبط = سترتش مستحيل
 
         br_m = self.src_bitrate / 1_000_000 if self.src_bitrate else 0
         cap_m = max(6.0, min(12.0, br_m * 2.2)) if br_m > 0 else 8.0
         self.maxrate = f"{cap_m:.0f}M"
-        print(f"🎞 src={self.src_w}x{self.src_h} rot={self.rotation} auto={self._auto_rotated} → {self.width}x{self.height} @ {self.fps:.2f} maxrate={self.maxrate}")
+        print(f"🎞 src={self.src_w}x{self.src_h} rot_pick={self.frame_rot} → {self.width}x{self.height} @ {self.fps:.2f} maxrate={self.maxrate}")
         self.enc = PipeEncoder(self.width, self.height, self.fps, output_path,
                                audio_src, "1:1", ENCODE_CRF, ENCODE_PRESET, self.maxrate)
-        # ✅ نص واحد فقط لكل النصوص
         self.text_variants = ["Tel:@vamp1r3s"]
         self.vip_text = "Telegram:@vamp1r3s"
         self.vip_vary = random.randint(1, 10**9)
@@ -288,6 +281,30 @@ class FloatingWatermark:
         self._init_vip()
         self.ghosts = []
         self._init_ghosts()
+
+    # ✅ اختيار الاتجاه: مطابقة نسبة المحتوى لنسبة العرض المقصودة + أفضلية لبيانات الملف
+    def _pick_orientation(self, frame, disp_aspect, meta_rot):
+        cands = [0, 90, 180, 270]
+        aspects = []
+        for r in cands:
+            f = self._rot90(frame, r)
+            aspects.append(f.shape[1] / max(1, f.shape[0]))
+        match = [r for r, a in zip(cands, aspects)
+                 if abs(a - disp_aspect) / max(1e-6, disp_aspect) < 0.05]
+        meta_norm = int(meta_rot) % 360
+        meta_idx = meta_norm if meta_norm in (0, 90, 180, 270) else 0
+        if match:
+            return meta_idx if meta_idx in match else match[0]
+        return min(zip(cands, aspects), key=lambda t: abs(t[1] - disp_aspect))[0]
+
+    def _rot90(self, frame, r):
+        if r == 90:
+            return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        if r == 180:
+            return cv2.rotate(frame, cv2.ROTATE_180)
+        if r == 270:
+            return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        return frame
 
     @property
     def strong_text(self):
@@ -572,7 +589,6 @@ class FloatingWatermark:
         return best if best is not None else (x, y)
 
     def _make_watermark(self, wm_type):
-        # ✅ 15% نصوص "مرساة": أكبر وأوضح = ترميمها بعد الإزالة مستحيل نظيف
         anchor = (wm_type == "strong" and random.random() < 0.15)
         if anchor:
             font_size = random.randint(self.strong_max_font, max(self.strong_max_font + 2, int(self.strong_max_font * 1.5)))
@@ -603,7 +619,6 @@ class FloatingWatermark:
 
         prof = random.random()
         if anchor:
-            # ✅ المراسي: واضحة للقراءة (55-65%) = أي إزالة تركب تشويه كبير
             op_mid, op_amp = random.uniform(0.55, 0.65), random.uniform(0.04, 0.08)
             fx_nyq = random.uniform(15.0, 24.0)
             fx_bayer = random.uniform(18.0, 26.0)
@@ -921,7 +936,6 @@ class FloatingWatermark:
         self.vip["age"] += 1
         self.vip["t"] += dt
         t = self.vip["t"]
-        # ✅ أوضح: 88% أسود بولد = أغمق وأبين شي بالشاشة
         alpha = 0.88 + 0.01 * math.sin(t * 0.4)
         fade_f = max(10, int(0.8 * self.fps))
         if self.vip["age"] < fade_f:
@@ -981,32 +995,19 @@ class FloatingWatermark:
                 frame[y0:y1, x0:x1].astype(np.float32) + add[:, :, None], 0, 255).astype(np.uint8)
         return frame
 
-    def _rotate_meta(self, frame):
-        if self.rotation in (90, -270):
-            return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-        elif self.rotation in (-90, 270):
-            return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-        elif self.rotation == 180:
-            return cv2.rotate(frame, cv2.ROTATE_180)
-        return frame
-
+    # ✅ تدوير ثابت محسوب من أول فريم + شبكة أمان لكل فريم
     def _apply_rotation(self, frame):
-        frame = self._rotate_meta(frame)
-        h, w = frame.shape[:2]
+        frame = self._rot90(frame, self.frame_rot)
         ta = self.width / max(1, self.height)
-        ca = w / max(1, h)
-        if abs(ca - ta) / max(1e-6, ta) > 0.05:
-            f90 = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-            f270 = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-            ca90 = f90.shape[1] / max(1, f90.shape[0])
-            ca270 = f270.shape[1] / max(1, f270.shape[0])
-            frame = f90 if abs(ca90 - ta) < abs(ca270 - ta) else f270
+        ca = frame.shape[1] / max(1, frame.shape[0])
+        if abs(ca - ta) / max(1e-6, ta) > 0.02:
+            best = min([0, 90, 180, 270],
+                       key=lambda r: abs((self._rot90(frame, r).shape[1] / max(1, self._rot90(frame, r).shape[0])) - ta))
+            frame = self._rot90(frame, best)
         return frame
 
     def process_frame(self, raw_frame, frame_num):
         frame = self._apply_rotation(raw_frame)
-        if self.need_resize and (frame.shape[1] != self.width or frame.shape[0] != self.height):
-            frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
         if frame.shape[1] != self.width or frame.shape[0] != self.height:
             frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
         out = frame
@@ -1056,7 +1057,6 @@ class FloatingWatermark:
             sprite = self._adaptive_bind(sprite, self._frame_detail, self._frame_edges,
                                          self._frame_texture, x, y, wm["bind_gain"], wm["bind_amod"])
             sprite = self._apply_edge_camouflage(sprite, self._frame_edges, self._frame_texture, x, y)
-            # ✅ هالة داكنة خفيفة للمراسي فقط = وضوح للقراءة بدون تغبيش عام
             if wm.get("anchor"):
                 halo, hm = self._get_halo(txt, wm["font_size"], bold=False,
                                           halo_color=30, halo_strength=0.25,
@@ -1166,10 +1166,6 @@ async def process_job(job):
         if not os.path.exists(inp) or os.path.getsize(inp) == 0:
             await msg.edit_text("❌ فشل تحميل الفيديو")
             return
-        cap_t = cv2.VideoCapture(inp)
-        info = extract_info(probe_video(inp), cap_t)
-        cap_t.release()
-        job["dims"] = f"{info['true_w']}x{info['true_h']}"
         job["stage"] = "watermark"
         job["frames_done"] = 0
         job["t0"] = time.time()
@@ -1198,11 +1194,11 @@ async def process_job(job):
         job["stage"] = "upload"
         await message.reply_video(out, caption=(
             "✓ تمت إضافة الحقوق 🎬\n\n"
+            "📐 أبعاد من محتوى الفيديو = صفر سترتش\n"
             "🖤 Telegram:@vamp1r3s أسود واضح 88%\n"
-            "⚓ 6 مراسي واضحة = أي إزالة تركب تشويه كبير\n"
-            "🖋 40 نص Tel:@vamp1r3s فقط\n"
-            "👁 مقطع صافي ومريح (Sharpening + بدون هالات)\n"
-            "🛡️ تقوية شاملة ضد dewatermark.ai\n\n"
+            "🖋 40 نص Tel:@vamp1r3s + 6 مراسي مدمرة\n"
+            "🛡️ مضاد لمنهجية dewatermark (كشف/ترميم/زمن)\n"
+            "👁 مقطع صافي ومريح للعين\n\n"
             f"📐 {w.width}x{w.height} | rot {w.rotation}°\n"
             f"🎞 CRF {ENCODE_CRF} | maxrate {w.maxrate}\n"
             f"⏱ المعالجة: {fmt_time(elapsed)}"))
@@ -1240,11 +1236,11 @@ async def worker():
 @app.on_message(filters.command("start"))
 async def start(c, m):
     await m.reply("👋 هلا! 🎬\n\nأرسل فيديو وأضيف الحقوق:\n\n"
+                  "📐 أبعاد من محتوى الفيديو = صفر سترتش\n"
                   "🖤 Telegram:@vamp1r3s أسود واضح أغمق من الكل\n"
-                  "🖋 40 نص Tel:@vamp1r3s فقط\n"
-                  "⚓ مراسي واضحة = إزالة مستحيلة نظيفة\n"
-                  "👁 مقطع صافي ومريح للعين\n"
-                  "📐 بدون سترتش | 🚀 سريع")
+                  "🖋 40 نص Tel:@vamp1r3s + مراسي مدمرة للإزالة\n"
+                  " مقطع صافي ومريح للعين\n"
+                  "🚀 سريع | 💾 حجم معقول")
 
 
 @app.on_message(filters.video)
@@ -1270,7 +1266,7 @@ async def status(c, m):
 async def main():
     print("🤖 تشغيل البوت...")
     await app.start()
-    print("✓ البوت شغال | نص واحد + مراسي مدمرة + VIP أوضح + مقطع صافي")
+    print("✓ البوت شغال | هيكل جديد: أبعاد من المحتوى + مضاد منهجية dewatermark")
     asyncio.create_task(worker())
     try:
         from pyrogram import idle
