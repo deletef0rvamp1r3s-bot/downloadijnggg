@@ -1,3 +1,6 @@
-pyrogram
-tgcrypto
-flask
+pyrogram==2.0.106
+tgcrypto==1.2.5
+opencv-python-headless==4.10.0.84
+pillow==10.4.0
+numpy==1.26.4
+nest-asyncio==1.6.0
