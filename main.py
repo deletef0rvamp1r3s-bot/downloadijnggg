@@ -1,217 +1,1197 @@
 import os
-import re
+import json
+import subprocess
+
+TEMP_DIR = "/tmp/watermark_bot"
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+subprocess.run(["wget", "-q", "-O", f"{TEMP_DIR}/Poppins-Medium.ttf",
+    "https://github.com/google/fonts/raw/main/ofl/poppins/Poppins-Medium.ttf"])
+subprocess.run(["wget", "-q", "-O", f"{TEMP_DIR}/Poppins-Bold.ttf",
+    "https://github.com/google/fonts/raw/main/ofl/poppins/Poppins-Bold.ttf"])
+
 import asyncio
-from threading import Thread
-from flask import Flask
-from pyrogram import Client, filters
-from pyrogram.types import InputMediaVideo, InputMediaDocument, InputMediaPhoto, InputMediaAnimation, InputMediaAudio
-from pyrogram.errors import FloodWait
+import random
+import uuid
+import math
+import time
+from pathlib import Path
 
-web_server = Flask(__name__)
+import numpy as np
+import cv2
+import nest_asyncio
 
-@web_server.route('/')
-def home():
-    return "Bot is alive and running!"
+from PIL import Image, ImageDraw, ImageFont
 
-def run_web_server():
-    port = int(os.environ.get("PORT", 8080))
-    web_server.run(host="0.0.0.0", port=port)
+nest_asyncio.apply()
 
-API_ID = int(os.environ.get("API_ID", 0))
+API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
-SESSION_STRING = os.environ.get("SESSION_STRING", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
-app = Client("my_account", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING, sleep_threshold=60)
+if not API_ID or not API_HASH or not BOT_TOKEN:
+    raise ValueError("⚠️ عبي المتغيرات في Railway: API_ID, API_HASH, BOT_TOKEN")
 
-user_states = {}
+ENCODE_CRF = 18
+ENCODE_PRESET = "veryfast"
+TIME_HARD_SEC = 29 * 60
 
-@app.on_message(filters.me & filters.regex(r"^https://t\.me/(c/)?(.+)/(\d+)$"))
-async def fetch_restricted_video(client, message):
-    link = message.text
-    match = re.search(r"^https://t\.me/(c/)?(.+)/(\d+)$", link)
-    if not match:
-        return
-        
-    is_private = match.group(1)
-    chat_identifier = match.group(2)
-    msg_id = int(match.group(3))
-    
-    if is_private:
-        chat_id = int(f"-100{chat_identifier}")
-    else:
-        chat_id = chat_identifier
-        
-    user_states[message.from_user.id] = {
-        "chat_id": chat_id,
-        "start_id": msg_id
-    }
-    
-    await message.reply_text(
-        f"🔗 تم التقاط الرابط للرسالة رقم `{msg_id}`.\n\n"
-        "💡 أرسل `فقط` لسحب هذا المقطع، أو أرسل **رقم الرسالة النهائية** لسحب مجموعة."
-    )
+STRONG_COUNT = 40
+FLICK_COUNT = 3
+GHOST_COUNT = 4
+MAX_QUEUE = 6
 
-@app.on_message(filters.me & filters.text & ~filters.regex(r"^https://t\.me/"))
-async def handle_download_choice(client, message):
-    user_id = message.from_user.id
-    
-    if user_id not in user_states:
-        return
-        
-    text = message.text.strip()
-    state = user_states[user_id]
-    chat_id = state["chat_id"]
-    start_id = state["start_id"]
-    
-    if text == "فقط":
-        end_id = start_id
-    elif text.isdigit():
-        end_id = int(text)
-        if end_id <= start_id:
-            await message.reply_text("❌ الرقم النهائي يجب أن يكون أكبر من رقم البداية.")
-            return
-    else:
-        return
-        
-    del user_states[user_id]
-    
-    notification = await message.reply_text("⏳ جاري التحقق من القناة...")
-    
+HALO_STRENGTH = 0.20
+HALO_SIGMA = 4.0
+HALO_DILATE = 4
+HALO_COLOR = 90
+HALO_PULSE_AMP = 0.05
+HALO_PULSE_FREQ = 0.08
+
+MICRO_ROTATION = True
+STROKE_GAMMA = True
+TEXT_PARITY = True
+PARITY_AMP_TEXT = 2.5
+PARITY_BLOCK = 8
+NYQ_AMP = (10.0, 16.0)
+BAYER_AMP = (12.0, 18.0)
+
+PROGRESS_INTERVAL = 2.0
+
+for f in Path(TEMP_DIR).glob("*.session*"):
     try:
-        await client.get_messages(chat_id, start_id)
-    except Exception as e:
-        if "peer_id_invalid" in str(e).lower() or "peer id invalid" in str(e).lower():
-            await notification.edit_text("⏳ جاري البحث عن القناة للتعرف عليها...")
-            found = False
-            count = 0
-            async for dialog in client.get_dialogs():
-                count += 1
-                if count % 50 == 0:
-                    await notification.edit_text(f"🔍 مستمر في البحث... (تم فحص {count} محادثة)")
-                if dialog.chat.id == chat_id:
-                    found = True
-                    break
-            if not found:
-                return await notification.edit_text("❌ بحثت في محادثاتك ولم أجد القناة! تأكد أنك منضم إليها.")
-        else:
-            return await notification.edit_text(f"❌ حدث خطأ غير متوقع: {e}")
-            
-    await notification.edit_text(f"✅ تم بدء السحب من {start_id} إلى {end_id}...")
-    processed_groups = set()
-    success_count = 0
-    
-    for current_id in range(start_id, end_id + 1):
-        retry_count = 0
-        
-        while retry_count < 3: 
-            files_to_delete = []
-            file_path = None
-            thumb_path = None
-            
+        f.unlink()
+    except Exception:
+        pass
+
+
+def probe_video(path):
+    cmd = ["ffprobe", "-v", "quiet", "-print_format", "json",
+           "-show_streams", "-show_format", path]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            return json.loads(r.stdout)
+    except Exception:
+        pass
+    return None
+
+
+def extract_info(probe_res, cap):
+    cv_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
+    cv_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
+    cv_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    cv_n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    out = {"src_w": cv_w, "src_h": cv_h, "true_w": cv_w, "true_h": cv_h,
+           "rotation": 0, "sar_val": 1.0, "fps": cv_fps, "total": cv_n, "bitrate": 0}
+    if probe_res is None:
+        return out
+    vs = None
+    for s in probe_res.get("streams", []):
+        if s.get("codec_type") == "video":
+            vs = s
+            break
+    if vs is None:
+        return out
+    src_w = int(vs.get("width", cv_w))
+    src_h = int(vs.get("height", cv_h))
+    sar_val = 1.0
+    sar_str = vs.get("sample_aspect_ratio", "1:1") or "1:1"
+    if ":" in sar_str:
+        try:
+            n, d = sar_str.split(":")
+            sar_val = float(n) / float(d) if float(d) else 1.0
+        except Exception:
+            sar_val = 1.0
+    rotation = 0
+    for sd in vs.get("side_data_list", []):
+        if "rotation" in sd:
             try:
-                if current_id % 2 == 0: # تحديث الرسالة بشكل أسرع لتعرف أين وصل
-                    try: await notification.edit_text(f"⏳ جاري المعالجة... (وصلنا للرسالة {current_id} من أصل {end_id})")
-                    except: pass
-                    
-                msg = await client.get_messages(chat_id, current_id)
-                
-                # إذا كانت الرسالة محذوفة أو نصية فقط (لا تحتوي على ميديا)، نتخطاها
-                if msg.empty or not msg.media:
-                    break 
-                    
-                # --- 1. معالجة الألبومات (Media Group) ---
-                if msg.media_group_id:
-                    if msg.media_group_id in processed_groups:
-                        break 
-                    processed_groups.add(msg.media_group_id)
-                    
-                    media_group = await client.get_media_group(chat_id, current_id)
-                    media_to_send = []
-                    
-                    for m in media_group:
-                        if m.media:
-                            file_path = await m.download()
-                            if not file_path: continue
-                            files_to_delete.append(file_path)
-                            
-                            thumb_path = None
-                            if m.video and getattr(m.video, "thumbs", None):
-                                thumb_path = await client.download_media(m.video.thumbs[0].file_id)
-                            elif m.document and getattr(m.document, "thumbs", None):
-                                thumb_path = await client.download_media(m.document.thumbs[0].file_id)
-                                
-                            if thumb_path: files_to_delete.append(thumb_path)
-                                
-                            # تصنيف الميديا داخل الألبوم (بما فيها الـ GIF)
-                            if m.video:
-                                media_to_send.append(InputMediaVideo(media=file_path, duration=m.video.duration or 0, width=m.video.width or 0, height=m.video.height or 0, thumb=thumb_path))
-                            elif m.animation:
-                                media_to_send.append(InputMediaAnimation(media=file_path))
-                            elif m.document:
-                                media_to_send.append(InputMediaDocument(media=file_path, thumb=thumb_path))
-                            elif m.photo:
-                                media_to_send.append(InputMediaPhoto(media=file_path))
-                            elif m.audio:
-                                media_to_send.append(InputMediaAudio(media=file_path))
-                                
-                    if media_to_send:
-                        await client.send_media_group("me", media_to_send)
-                        success_count += len(media_to_send)
-                        
-                    for f in files_to_delete:
-                        if f and os.path.exists(f): os.remove(f)
-                        
-                # --- 2. معالجة الرسائل الفردية (فيديو، صورة، GIF، صوت، ملف، ملصق) ---
-                else:
-                    if msg.media:
-                        file_path = await msg.download()
-                        if not file_path: break
-                        
-                        thumb_path = None
-                        if msg.video and getattr(msg.video, "thumbs", None):
-                            thumb_path = await client.download_media(msg.video.thumbs[0].file_id)
-                        elif msg.document and getattr(msg.document, "thumbs", None):
-                            thumb_path = await client.download_media(msg.document.thumbs[0].file_id)
-                            
-                        # إرسال الميديا بناءً على نوعها
-                        if msg.video:
-                            await client.send_video("me", file_path, duration=msg.video.duration or 0, width=msg.video.width or 0, height=msg.video.height or 0, thumb=thumb_path)
-                        elif msg.animation:
-                            await client.send_animation("me", file_path)
-                        elif msg.sticker:
-                            await client.send_sticker("me", file_path)
-                        elif msg.voice:
-                            await client.send_voice("me", file_path)
-                        elif msg.audio:
-                            await client.send_audio("me", file_path)
-                        elif msg.document:
-                            await client.send_document("me", file_path, thumb=thumb_path)
-                        elif msg.photo:
-                            await client.send_photo("me", file_path)
-                            
-                        success_count += 1
-                        
-                        if file_path and os.path.exists(file_path): os.remove(file_path)
-                        if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
-                        
+                rotation = int(float(sd["rotation"]))
+            except Exception:
+                pass
+            break
+    if not rotation:
+        for k, v in (vs.get("tags", {}) or {}).items():
+            if "rotate" in k.lower():
+                try:
+                    rotation = int(float(v))
+                except Exception:
+                    pass
+    if rotation in (90, -90, 270, -270):
+        disp_w = int(round(src_h * sar_val)); disp_h = src_w
+    else:
+        disp_w = int(round(src_w * sar_val)); disp_h = src_h
+    disp_w += disp_w % 2
+    disp_h += disp_h % 2
+    fps = cv_fps
+    rf = vs.get("r_frame_rate", "")
+    if "/" in str(rf):
+        try:
+            n, d = rf.split("/")
+            fps = float(n) / float(d) if float(d) else cv_fps
+        except Exception:
+            pass
+    total = cv_n
+    nb = vs.get("nb_frames")
+    try:
+        total = int(nb) if nb and nb != "N/A" else cv_n
+    except Exception:
+        pass
+    if total <= 0:
+        try:
+            dur = float(probe_res.get("format", {}).get("duration", 0))
+            total = int(dur * fps) if dur > 0 else 1
+        except Exception:
+            total = 1
+    br = 0
+    try:
+        br = int(probe_res.get("format", {}).get("bit_rate", 0) or 0)
+    except Exception:
+        pass
+    out.update({"src_w": src_w, "src_h": src_h, "true_w": disp_w, "true_h": disp_h,
+                "rotation": rotation, "sar_val": sar_val, "fps": fps,
+                "total": total, "bitrate": br})
+    return out
+
+
+class PipeEncoder:
+    def __init__(self, width, height, fps, out_path, audio_src, sar_str="1:1",
+                 crf=ENCODE_CRF, preset=ENCODE_PRESET, maxrate=None):
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+               "-f", "rawvideo", "-pix_fmt", "bgr24",
+               "-s", f"{width}x{height}", "-r", f"{fps:.6f}", "-i", "pipe:0"]
+        if audio_src and os.path.exists(audio_src):
+            cmd += ["-i", audio_src]
+        cmd += ["-map", "0:v:0"]
+        if audio_src and os.path.exists(audio_src):
+            cmd += ["-map", "1:a:0?"]
+        cmd += ["-c:v", "libx264", "-crf", str(crf), "-preset", preset,
+                "-pix_fmt", "yuv420p", "-profile:v", "high",
+                "-vf", f"setsar={sar_str}",
+                "-tune", "film",
+                "-x264-params", "aq-mode=3:aq-strength=0.9:ref=2:me=dia:subme=2:trellis=1"]
+        if maxrate:
+            cmd += ["-maxrate", maxrate, "-bufsize", str(int(maxrate.replace("M", "")) * 2) + "M"]
+        if audio_src and os.path.exists(audio_src):
+            cmd += ["-c:a", "aac", "-b:a", "128k"]
+        cmd += ["-movflags", "+faststart", "-shortest", "-y", out_path]
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+    def write(self, frame):
+        try:
+            self.proc.stdin.write(frame.tobytes())
+        except BrokenPipeError:
+            pass
+
+    def close(self):
+        try:
+            if self.proc.stdin:
+                self.proc.stdin.close()
+            self.proc.wait(timeout=300)
+        except Exception:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+
+
+class FloatingWatermark:
+    def __init__(self, video_path, output_path, audio_src=None):
+        self.video_path = video_path
+        self.output_path = output_path
+        self.cap = cv2.VideoCapture(video_path)
+        if not self.cap.isOpened():
+            raise ValueError("❌ ما قدرت أفتح الفيديو")
+        info = extract_info(probe_video(video_path), self.cap)
+        self.src_w, self.src_h = info["src_w"], info["src_h"]
+        self.width, self.height = info["true_w"], info["true_h"]
+        self.rotation = info["rotation"]
+        self.sar_val = info["sar_val"]
+        self.need_resize = (self.src_w != self.width) or (self.src_h != self.height) or (self.rotation != 0)
+        self.fps = info["fps"] if info["fps"] > 0 else 30.0
+        self.total_frames = info["total"]
+        self.src_bitrate = info["bitrate"]
+        br_m = self.src_bitrate / 1_000_000 if self.src_bitrate else 0
+        cap_m = max(6.0, min(12.0, br_m * 2.2)) if br_m > 0 else 8.0
+        self.maxrate = f"{cap_m:.0f}M"
+        print(f"🎞 {self.src_w}x{self.src_h} rot={self.rotation} → {self.width}x{self.height} @ {self.fps:.2f} maxrate={self.maxrate}")
+        self.enc = PipeEncoder(self.width, self.height, self.fps, output_path,
+                               audio_src, "1:1", ENCODE_CRF, ENCODE_PRESET, self.maxrate)
+        self.strong_text = "Tel:@vamp1r3s"
+        self.vip_text = "Telegram:@vamp1r3s"
+        self.font_path = self._get_font_path()
+        self.bold_font_path = self._get_bold_font_path()
+        self.use_pil = (self.font_path is not None) or (self.bold_font_path is not None)
+        self._font_cache = {}
+        self._sprite_cache = {}
+        self._halo_cache = {}
+        base = min(self.width, self.height)
+        old_min = max(14, int(base * 0.020))
+        old_max = max(old_min + 4, int(base * 0.040))
+        strong_min = max(12, int(old_min * 0.55))
+        strong_max = max(strong_min + 4, int(old_max * 0.55))
+        max_strong_w = int((self.width * 0.90) / max(10, len(self.strong_text) * 0.60))
+        strong_max = max(strong_min + 4, min(strong_max, max_strong_w))
+        vip_size = max(strong_max + 6, int(base * 0.062))
+        max_vip_w = int((self.width * 0.92) / max(10, len(self.vip_text) * 0.68))
+        vip_size = max(strong_min + 6, min(vip_size, max_vip_w))
+        if vip_size <= strong_max:
+            vip_size = strong_max + 6
+        self.strong_min_font = strong_min
+        self.strong_max_font = strong_max
+        self.vip_font_size = vip_size
+        self.grid_cols = 7
+        self.grid_rows = 8
+        self._cell_queue = []
+        self._bottom_queue = []
+        self.top_fade_margin = 80
+        self._MAXH = int(max(self.vip_font_size, self.strong_max_font) * 2.6) + 80
+        self._MAXW = min(self.width, 1600) + 80
+        ii, jj = np.ogrid[0:self._MAXH, 0:self._MAXW]
+        self._checker_base = (((ii + jj) & 1).astype(np.float32) * 2.0 - 1.0)
+        b4 = np.array([[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]],
+                      dtype=np.float32) / 16.0 - 0.5
+        self._bayer_big = np.tile(b4, (self._MAXH // 4 + 1, self._MAXW // 4 + 1))[:self._MAXH, :self._MAXW]
+        self._grad_cache = {}
+        self._frame_detail = None
+        self._frame_edges = None
+        self._frame_texture = None
+        self._maps_frame = -10
+        rng = np.random.RandomState(1337)
+        bh = (self.height + PARITY_BLOCK - 1) // PARITY_BLOCK
+        bw = (self.width + PARITY_BLOCK - 1) // PARITY_BLOCK
+        blocks = rng.choice([-1.0, 1.0], size=(bh, bw)).astype(np.float32)
+        self._parity1 = np.kron(blocks, np.ones((PARITY_BLOCK, PARITY_BLOCK), dtype=np.float32))[:self.height, :self.width]
+        self.watermarks = []
+        self.initialize_watermarks()
+        self._init_vip()
+        self.ghosts = []
+        self._init_ghosts()
+
+    def _get_font_path(self):
+        for p in [os.path.join(TEMP_DIR, "Poppins-Medium.ttf"),
+                  os.path.join(TEMP_DIR, "Poppins-Bold.ttf"),
+                  "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]:
+            if os.path.exists(p):
+                return p
+        return None
+
+    def _get_bold_font_path(self):
+        for p in [os.path.join(TEMP_DIR, "Poppins-Bold.ttf"),
+                  "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                  os.path.join(TEMP_DIR, "Poppins-Medium.ttf")]:
+            if os.path.exists(p):
+                return p
+        return None
+
+    def _get_font(self, size):
+        if not self.use_pil:
+            return None
+        path = self.bold_font_path if size >= self.vip_font_size else self.font_path
+        if not path:
+            return None
+        key = (int(size), path)
+        if key not in self._font_cache:
+            try:
+                self._font_cache[key] = ImageFont.truetype(path, int(size))
+            except Exception:
+                self._font_cache[key] = None
+        return self._font_cache[key]
+
+    def _get_grad_refl(self, H, W):
+        key = (H, W)
+        gr = self._grad_cache.get(key)
+        if gr is None:
+            yy = (np.arange(H, dtype=np.float32) / max(1, H))[:, None]
+            xx = (np.arange(W, dtype=np.float32) / max(1, W))[None, :]
+            g = (xx + yy) * 0.5
+            grad25 = ((g - 0.5) * 25.0).astype(np.float32)
+            refl = np.exp(-((g - 0.5) ** 2) / 0.05).astype(np.float32)
+            gradv = (np.arange(H, dtype=np.float32) / max(1, H))[:, None]
+            gr = (grad25, refl, gradv)
+            if len(self._grad_cache) > 96:
+                self._grad_cache.clear()
+            self._grad_cache[key] = gr
+        return gr
+
+    def _make_sprite(self, text, font_size, bold=False):
+        path = self.bold_font_path if bold else self.font_path
+        if not self.use_pil or not path:
+            return None
+        key = (text, int(font_size), bold)
+        if key in self._sprite_cache:
+            return self._sprite_cache[key]
+        font = self._get_font(font_size)
+        if font is None:
+            return None
+        pad = max(6, int(font_size * 0.25))
+        tmp = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
+        dr = ImageDraw.Draw(tmp)
+        try:
+            bbox = dr.textbbox((0, 0), text, font=font)
+        except Exception:
+            bbox = (0, 0, int(font_size * 0.6 * len(text)), int(font_size))
+        tw = max(4, bbox[2] - bbox[0]); th = max(4, bbox[3] - bbox[1])
+        img = Image.new("RGBA", (tw + pad * 2, th + pad * 2), (0, 0, 0, 0))
+        dr = ImageDraw.Draw(img)
+        dr.text((pad - bbox[0], pad - bbox[1]), text, font=font, fill=(0, 0, 0, 255))
+        arr = np.array(img)
+        sprite = arr[:, :, [2, 1, 0, 3]].copy()
+        self._sprite_cache[key] = sprite
+        return sprite
+
+    def _get_halo(self, text, font_size, bold=False):
+        key = (text, int(font_size), bool(bold))
+        if key in self._halo_cache:
+            return self._halo_cache[key]
+        sprite = self._make_sprite(text, font_size, bold)
+        if sprite is None:
+            self._halo_cache[key] = (None, 0)
+            return None, 0
+        m = int(3 * HALO_SIGMA) + HALO_DILATE + 2
+        a = sprite[:, :, 3]
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (HALO_DILATE * 2 + 1, HALO_DILATE * 2 + 1))
+        a = cv2.dilate(a, k, iterations=1)
+        a = cv2.GaussianBlur(a, (0, 0), HALO_SIGMA)
+        H, W = a.shape[:2]
+        canvas = np.zeros((H + 2 * m, W + 2 * m), dtype=np.float32)
+        canvas[m:m + H, m:m + W] = a.astype(np.float32)
+        halo = np.zeros((H + 2 * m, W + 2 * m, 4), dtype=np.uint8)
+        halo[:, :, 0] = HALO_COLOR; halo[:, :, 1] = HALO_COLOR; halo[:, :, 2] = HALO_COLOR
+        halo[:, :, 3] = np.clip(canvas * HALO_STRENGTH, 0, 255).astype(np.uint8)
+        if len(self._halo_cache) > 60:
+            self._halo_cache.clear()
+        self._halo_cache[key] = (halo, m)
+        return halo, m
+
+    def _blend_sprite(self, frame, sprite, x, y, alpha):
+        if sprite is None or alpha <= 0.0:
+            return
+        H, W = frame.shape[:2]
+        sh, sw = sprite.shape[:2]
+        x0, y0 = int(round(x)), int(round(y))
+        sx0, sy0 = max(0, -x0), max(0, -y0)
+        sx1, sy1 = max(0, min(sw, W - x0)), max(0, min(sh, H - y0))
+        if sx1 <= sx0 or sy1 <= sy0:
+            return
+        dx0, dy0 = max(0, x0), max(0, y0)
+        roi = frame[dy0:dy0 + (sy1 - sy0), dx0:dx0 + (sx1 - sx0)].astype(np.float32)
+        spr = sprite[sy0:sy1, sx0:sx1]
+        a = (spr[:, :, 3:4].astype(np.float32) / 255.0) * float(alpha)
+        rgb = spr[:, :, :3].astype(np.float32)
+        frame[dy0:dy0 + (sy1 - sy0), dx0:dx0 + (sx1 - sx0)] = \
+            np.clip(rgb * a + roi * (1.0 - a), 0, 255).astype(np.uint8)
+
+    def _blend_sprite_overlay(self, frame, sprite, x, y, alpha):
+        if sprite is None or alpha <= 0.0:
+            return
+        H, W = frame.shape[:2]
+        sh, sw = sprite.shape[:2]
+        x0, y0 = int(round(x)), int(round(y))
+        sx0, sy0 = max(0, -x0), max(0, -y0)
+        sx1, sy1 = max(0, min(sw, W - x0)), max(0, min(sh, H - y0))
+        if sx1 <= sx0 or sy1 <= sy0:
+            return
+        dx0, dy0 = max(0, x0), max(0, y0)
+        roi = frame[dy0:dy0 + (sy1 - sy0), dx0:dx0 + (sx1 - sx0)].astype(np.float32) / 255.0
+        spr = sprite[sy0:sy1, sx0:sx1]
+        a = (spr[:, :, 3:4].astype(np.float32) / 255.0) * float(alpha)
+        s = spr[:, :, :3].astype(np.float32) / 255.0
+        ov = np.where(roi < 0.5, 2.0 * roi * s, 1.0 - 2.0 * (1.0 - roi) * (1.0 - s))
+        outp = roi * (1.0 - a) + ov * a
+        frame[dy0:dy0 + (sy1 - sy0), dx0:dx0 + (sx1 - sx0)] = \
+            np.clip(outp * 255.0, 0, 255).astype(np.uint8)
+
+    def _adaptive_bind(self, sprite, detail, edges, texture, x, y, gain, amod):
+        if sprite is None or detail is None:
+            return sprite
+        H, W = detail.shape[:2]
+        sh, sw = sprite.shape[:2]
+        x0, y0 = int(round(x)), int(round(y))
+        sx0, sy0 = max(0, -x0), max(0, -y0)
+        sx1, sy1 = max(0, min(sw, W - x0)), max(0, min(sh, H - y0))
+        if sx1 <= sx0 or sy1 <= sy0:
+            return sprite
+        dx0, dy0 = max(0, x0), max(0, y0)
+        dx1, dy1 = min(W, x0 + sw), min(H, y0 + sh)
+        dmap = np.zeros((sh, sw), dtype=np.float32)
+        dmap[sy0:sy1, sx0:sx1] = detail[dy0:dy1, dx0:dx1]
+        emap = np.zeros((sh, sw), dtype=np.float32)
+        if edges is not None:
+            emap[sy0:sy1, sx0:sx1] = edges[dy0:dy1, dx0:dx1]
+        tmap = np.zeros((sh, sw), dtype=np.float32)
+        if texture is not None:
+            tmap[sy0:sy1, sx0:sx1] = texture[dy0:dy1, dx0:dx1]
+        spr = sprite.copy()
+        mask = (spr[:, :, 3] > 10).astype(np.float32)
+        rgb = spr[:, :, :3].astype(np.float32)
+        rgb += dmap[:, :, None] * gain * mask[:, :, None]
+        edge_weight = np.clip(emap / 100.0, 0, 1)
+        rgb += emap[:, :, None] * (gain * 0.5) * edge_weight[:, :, None] * mask[:, :, None]
+        texture_weight = np.clip(tmap / 80.0, 0, 1)
+        rgb += tmap[:, :, None] * (gain * 0.3) * texture_weight[:, :, None] * mask[:, :, None]
+        spr[:, :, :3] = np.clip(rgb, 0, 255).astype(np.uint8)
+        dn = np.clip(dmap / 50.0, -1.0, 1.0)
+        en = np.clip(emap / 80.0, 0, 1.0)
+        tn = np.clip(tmap / 60.0, 0, 1.0)
+        complexity = (en + tn) / 2.0
+        al = spr[:, :, 3].astype(np.float32) * (1.0 + amod * dn * mask)
+        al *= (1.0 - 0.3 * complexity * mask)
+        spr[:, :, 3] = np.clip(al, 0, 255).astype(np.uint8)
+        return spr
+
+    def _init_ghosts(self):
+        self.ghosts = [self._make_ghost() for _ in range(GHOST_COUNT)]
+
+    def _make_ghost(self):
+        size = int(self.strong_max_font * random.uniform(1.6, 2.4))
+        max_w = int((self.width * 0.9) / max(10, len(self.strong_text) * 0.62))
+        size = max(14, min(size, max_w))
+        est_w = int(size * len(self.strong_text) * 0.62); est_h = int(size * 1.6)
+        col, row = self._next_cell()
+        cw, ch = self.width / self.grid_cols, self.height / self.grid_rows
+        x = col * cw + cw * random.uniform(0.1, 0.9) - est_w / 2
+        y = row * ch + ch * random.uniform(0.1, 0.9) - est_h / 2
+        x = max(2, min(x, self.width - est_w - 2)); y = max(2, min(y, self.height - est_h - 2))
+        life = max(40, int(random.uniform(6, 10) * self.fps))
+        return {"x": x, "y": y, "vy_ps": random.uniform(60, 120), "font_size": size,
+                "base_alpha": random.uniform(0.030, 0.055), "life": life,
+                "age": random.randint(0, max(1, int(0.5 * self.fps))),
+                "fade_in": max(8, int(self.fps)), "fade_out": max(8, int(1.5 * self.fps)),
+                "bind_gain": random.uniform(3.5, 5.0), "bind_amod": random.uniform(0.20, 0.35)}
+
+    def _fade_alpha(self, wm):
+        base = wm.get("base_alpha", 1.0)
+        age, life = wm.get("age", 0), wm.get("life", 1)
+        fi, fo = wm.get("fade_in", 1), wm.get("fade_out", 1)
+        if age < fi:
+            f = age / max(1, fi)
+        elif age > life - fo:
+            f = max(0.0, (life - age) / max(1, fo))
+        else:
+            f = 1.0
+        return base * f
+
+    def _reshuffle(self):
+        cells = [(c, r) for r in range(self.grid_rows) for c in range(self.grid_cols)]
+        random.shuffle(cells)
+        self._cell_queue = cells
+
+    def _next_cell(self):
+        if not self._cell_queue:
+            self._reshuffle()
+        return self._cell_queue.pop()
+
+    def _reshuffle_bottom(self):
+        first_row = self.grid_rows // 2 - 1
+        cells = [(c, r) for r in range(first_row, self.grid_rows)
+                 for c in range(self.grid_cols)]
+        random.shuffle(cells)
+        self._bottom_queue = cells
+
+    def _next_bottom_cell(self):
+        if not self._bottom_queue:
+            self._reshuffle_bottom()
+        return self._bottom_queue.pop()
+
+    def _spawn_position(self, font_size, prefer_detail=False):
+        est_w = int(font_size * len(self.strong_text) * 0.62); est_h = int(font_size * 1.6)
+        best = None; best_score = -1.0
+        tries = 8 if prefer_detail else 1
+        x = y = 2.0
+        for _ in range(tries):
+            col, row = self._next_bottom_cell()
+            cw, ch = self.width / self.grid_cols, self.height / self.grid_rows
+            x = col * cw + cw * random.uniform(0.15, 0.85) - est_w / 2
+            y = row * ch + ch * random.uniform(0.15, 0.85) - est_h / 2
+            x = max(2, min(x, self.width - est_w - 2)); y = max(2, min(y, self.height - est_h - 2))
+            if not prefer_detail or self._frame_texture is None or self._frame_edges is None:
+                return x, y
+            x0, y0 = int(x), int(y)
+            x1 = min(int(x + est_w), self.width); y1 = min(int(y + est_h), self.height)
+            if x1 <= x0 or y1 <= y0:
+                return x, y
+            sc = (float(self._frame_texture[y0:y1, x0:x1].mean()) +
+                  0.5 * float(self._frame_edges[y0:y1, x0:x1].mean()) +
+                  random.uniform(0, 5))
+            if sc > best_score:
+                best_score = sc; best = (x, y)
+        return best if best is not None else (x, y)
+
+    def _make_watermark(self, wm_type):
+        font_size = random.randint(self.strong_min_font, self.strong_max_font)
+        if wm_type == "flick":
+            base_alpha = random.uniform(0.38, 0.42)
+            vy_ps = random.uniform(220, 360)
+            life_s = random.uniform(4.0, 7.0)
+            flick_hz = random.uniform(0.7, 1.4)
+            j_amp = random.uniform(0.3, 0.5)
+        else:
+            base_alpha = 1.0
+            vy_ps = random.uniform(120, 260)
+            life_s = random.uniform(4.5, 8.0)
+            flick_hz = 0.0
+            j_amp = random.uniform(0.25, 0.45)
+
+        fx_nyq = random.uniform(*NYQ_AMP)
+        fx_bayer = random.uniform(*BAYER_AMP)
+        fx_echo = random.uniform(0.28, 0.38)
+        bind_gain = random.uniform(3.5, 5.5)
+        bind_amod = random.uniform(0.25, 0.40)
+        pz_rot_amp = math.radians(random.uniform(0.8, 1.6))
+        pz_gam_amp = random.uniform(0.08, 0.13)
+        is_opaque = False
+
+        prof = random.random()
+        if prof < 0.30:
+            op_mid, op_amp = random.uniform(0.38, 0.50), random.uniform(0.10, 0.16)
+        elif prof < 0.60:
+            op_mid, op_amp = 1.0, 0.0
+            is_opaque = True
+            fx_nyq = random.uniform(14.0, 22.0)
+            fx_bayer = random.uniform(16.0, 24.0)
+            fx_echo = random.uniform(0.45, 0.60)
+            bind_gain = random.uniform(5.0, 7.0)
+            bind_amod = random.uniform(0.35, 0.50)
+            pz_rot_amp = math.radians(random.uniform(1.2, 2.0))
+            pz_gam_amp = random.uniform(0.12, 0.18)
+        else:
+            op_mid = random.uniform(0.40, 0.80)
+            op_amp = random.uniform(0.10, 0.25)
+            fx_nyq = random.uniform(15.0, 24.0)
+            fx_bayer = random.uniform(18.0, 26.0)
+            fx_echo = random.uniform(0.50, 0.70)
+            bind_gain = random.uniform(6.0, 8.0)
+            bind_amod = random.uniform(0.40, 0.60)
+            pz_rot_amp = math.radians(random.uniform(1.3, 2.2))
+            pz_gam_amp = random.uniform(0.13, 0.20)
+
+        blend = "overlay" if random.random() < 0.5 else "alpha"
+        prefer_detail = random.random() < 0.45
+
+        life = max(30, int(life_s * self.fps))
+        fi = max(6, int(0.7 * self.fps))
+        fo = max(10, int(1.3 * self.fps))
+        x, y = self._spawn_position(font_size, prefer_detail=prefer_detail)
+
+        return {
+            "type": wm_type, "blend": blend,
+            "x": x, "y": y, "vy_ps": vy_ps, "vx_ps": 0.0,
+            "fx_tilt": math.radians(random.uniform(-3, 3)),
+            "fx_grow_amp": random.uniform(0.06, 0.14),
+            "font_size": font_size, "base_alpha": base_alpha,
+            "life": life, "age": random.randint(0, fi), "fade_in": fi, "fade_out": fo,
+            "flick_hz": flick_hz,
+            "flick_phase": random.uniform(0, math.pi * 2) if flick_hz > 0 else 0.0,
+            "op_mid": op_mid, "op_amp": op_amp,
+            "op_period": random.uniform(3.0, 7.0),
+            "op_phase": random.uniform(0, math.pi * 2),
+            "is_opaque": is_opaque,
+            "pz_rot_amp": pz_rot_amp,
+            "pz_rot_freq": random.uniform(0.08, 0.18),
+            "pz_rot_ph": random.uniform(0, math.pi * 2),
+            "pz_gam_amp": pz_gam_amp,
+            "pz_gam_freq": random.uniform(0.10, 0.25),
+            "pz_gam_ph": random.uniform(0, math.pi * 2),
+            "pz_nyq_sign": random.choice([-1.0, 1.0]),
+            "pz_roll": random.choice([-1, 0, 1]),
+            "pz_par_sign": random.choice([-1.0, 1.0]),
+            "fx_color_drift_freq": random.uniform(0.06, 0.12),
+            "fx_color_drift_phase": random.uniform(0, math.pi * 2),
+            "fx_color_drift_amp": random.uniform(4, 8),
+            "fx_jx_amp": j_amp, "fx_jy_amp": j_amp * random.uniform(0.7, 1.1),
+            "fx_jx_freq": random.uniform(0.05, 0.12),
+            "fx_jy_freq": random.uniform(0.04, 0.10),
+            "fx_erode_freq": random.uniform(0.08, 0.15),
+            "fx_nyq": fx_nyq, "fx_bayer": fx_bayer,
+            "fx_echo": fx_echo, "fx_refl": random.uniform(30.0, 42.0),
+            "bind_gain": bind_gain, "bind_amod": bind_amod,
+            "fx_grad_dir": random.choice([0, 1, 2]), "fx_grad_strength": random.uniform(0.25, 0.55),
+            "fx_morph_amp": random.uniform(0.3, 0.6),
+            "fx_morph_freq": random.uniform(0.10, 0.20),
+            "fx_lum_flick": random.uniform(0.03, 0.06),
+            "fx_lum_freq": random.uniform(0.08, 0.15),
+        }
+
+    def initialize_watermarks(self):
+        self.watermarks = [self._make_watermark("strong") for _ in range(STRONG_COUNT)]
+        self.watermarks += [self._make_watermark("flick") for _ in range(FLICK_COUNT)]
+
+    def reset_watermark(self, idx):
+        old = self.watermarks[idx].get("type", "strong")
+        self.watermarks[idx] = self._make_watermark(old)
+
+    def _apply_fast_poisons(self, spr, frame_num):
+        if spr is None:
+            return spr
+        alpha = spr[:, :, 3]
+        mask = alpha > 10
+        if not mask.any():
+            return spr
+        H, W = spr.shape[:2]
+        np.random.seed((frame_num * 7919) % (2**32))
+        spr[:, 1:, 2] = spr[:, :-1, 2]
+        spr[:, :-1, 0] = spr[:, 1:, 0]
+        noise = np.random.randint(-3, 4, size=(H, W, 3), dtype=np.int16)
+        mask3 = np.stack([mask]*3, axis=-1)
+        spr_int16 = spr[:, :, :3].astype(np.int16)
+        spr_int16 += (noise * mask3)
+        spr[:, :, :3] = np.clip(spr_int16, 0, 255).astype(np.uint8)
+        a8 = alpha.astype(np.uint8)
+        k_edge = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        edge_mask = cv2.dilate(a8, k_edge, iterations=1) - cv2.erode(a8, k_edge, iterations=1)
+        edge_mask = (edge_mask > 10) & mask
+        if edge_mask.any():
+            edge_noise = np.random.randint(-8, 9, size=(H, W, 3), dtype=np.int16)
+            edge_mask3 = np.stack([edge_mask]*3, axis=-1)
+            spr_int16 = spr[:, :, :3].astype(np.int16)
+            spr_int16 += (edge_noise * edge_mask3)
+            spr[:, :, :3] = np.clip(spr_int16, 0, 255).astype(np.uint8)
+        alpha_int16 = alpha.astype(np.int16)
+        alpha_edge_noise = np.random.randint(-6, 7, size=(H, W), dtype=np.int16)
+        alpha_int16 += (alpha_edge_noise * edge_mask)
+        spr[:, :, 3] = np.clip(alpha_int16, 0, 255).astype(np.uint8)
+        return spr
+
+    def _apply_edge_camouflage(self, spr, edges, texture, x, y):
+        if spr is None or edges is None:
+            return spr
+        H, W = edges.shape[:2]
+        sh, sw = spr.shape[:2]
+        x0, y0 = int(round(x)), int(round(y))
+        sx0, sy0 = max(0, -x0), max(0, -y0)
+        sx1, sy1 = max(0, min(sw, W - x0)), max(0, min(sh, H - y0))
+        if sx1 <= sx0 or sy1 <= sy0:
+            return spr
+        dx0, dy0 = max(0, x0), max(0, y0)
+        dx1, dy1 = min(W, x0 + sw), min(H, y0 + sh)
+        local_edges = np.zeros((sh, sw), dtype=np.float32)
+        local_edges[sy0:sy1, sx0:sx1] = edges[dy0:dy1, dx0:dx1]
+        local_texture = np.zeros((sh, sw), dtype=np.float32)
+        if texture is not None:
+            local_texture[sy0:sy1, sx0:sx1] = texture[dy0:dy1, dx0:dx1]
+        mask = spr[:, :, 3] > 10
+        edge_intensity = np.clip(local_edges / 100.0, 0, 1)
+        texture_intensity = np.clip(local_texture / 80.0, 0, 1)
+        rgb = spr[:, :, :3].astype(np.float32)
+        mod = edge_intensity * 15.0 + texture_intensity * 10.0
+        rgb += mod[:, :, None] * mask[:, :, None]
+        spr[:, :, :3] = np.clip(rgb, 0, 255).astype(np.uint8)
+        return spr
+
+    def _apply_text_effects(self, sprite, wm, frame_num, orig_w, orig_h, orig_x, orig_y):
+        if sprite is None:
+            return sprite, orig_x, orig_y
+        H, W = sprite.shape[:2]
+        t = frame_num / self.fps
+        ph, ph2 = wm.get("fx_phase", 0.0), wm.get("fx_phase2", 0.0)
+        life = wm.get("life", 0)
+        p = min(1.0, max(0.0, wm.get("age", 0) / float(life))) if life else ((t % 6.0) / 6.0)
+        grow = 1.0 + wm.get("fx_grow_amp", 0.10) * math.sin(math.pi * p)
+        amp = wm.get("fx_breathe_amp", 0.03)
+        scale = (1.0 + amp * math.sin(t * wm.get("fx_breathe_freq", 0.8) + ph)) * grow
+        nH, nW = max(4, int(H * scale)), max(4, int(W * scale))
+        spr = cv2.resize(sprite, (nW, nH), interpolation=cv2.INTER_LINEAR)
+        cx, cy = orig_x + orig_w / 2.0, orig_y + orig_h / 2.0
+        nx, ny = cx - nW / 2.0, cy - nH / 2.0
+
+        rot = wm.get("fx_tilt", 0.0)
+        if MICRO_ROTATION:
+            rot += wm.get("pz_rot_amp", 0.02) * math.sin(
+                2 * math.pi * wm.get("pz_rot_freq", 0.12) * t + wm.get("pz_rot_ph", 0.0))
+        sc = 1.0 + 0.004 * math.sin(2 * math.pi * 0.15 * t + ph2)
+        a = sc * math.cos(rot); b = -sc * math.sin(rot)
+        c = sc * math.sin(rot); d = sc * math.cos(rot)
+        HW, HH = nW / 2.0, nH / 2.0
+        M = np.float32([[a, b, HW - a * HW - b * HH],
+                        [c, d, HH - c * HW - d * HH]])
+        spr = cv2.warpAffine(spr, M, (nW, nH), flags=cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
+
+        H_spr, W_spr = spr.shape[:2]
+        alpha = spr[:, :, 3].astype(np.float32)
+        rgb = spr[:, :, :3].astype(np.float32)
+        mask = (alpha > 10).astype(np.float32)
+
+        a8 = alpha.astype(np.uint8)
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        er = cv2.erode(a8, k, iterations=1)
+        band = ((a8.astype(np.int16) - er.astype(np.int16)) > 30) & (a8 > 12)
+        we = 0.5 + 0.5 * math.sin(t * wm.get("fx_erode_freq", 0.10) + ph2)
+        alpha = alpha * (1.0 - 0.5 * we) + er.astype(np.float32) * (0.5 * we)
+
+        if STROKE_GAMMA:
+            gj = 1.0 + wm.get("pz_gam_amp", 0.10) * math.sin(
+                2 * math.pi * wm.get("pz_gam_freq", 0.15) * t + wm.get("pz_gam_ph", 0.0))
+            alpha = 255.0 * np.power(np.clip(alpha / 255.0, 0.0, 1.0), gj)
+
+        lum_flick = wm.get("fx_lum_flick", 0.04)
+        lum_freq = wm.get("fx_lum_freq", 0.10)
+        lum_mod = 1.0 + lum_flick * math.sin(2 * math.pi * lum_freq * t + ph)
+        rgb *= lum_mod
+        rgb = np.clip(rgb, 0, 255)
+
+        use_big = (H_spr <= self._MAXH and W_spr <= self._MAXW)
+        if use_big:
+            chk = self._checker_base[:H_spr, :W_spr]
+        else:
+            ii, jj = np.ogrid[0:H_spr, 0:W_spr]
+            chk = (((ii + jj) & 1).astype(np.float32) * 2.0 - 1.0)
+        rgb += (chk * (wm.get("fx_nyq", 10.0) * wm.get("pz_nyq_sign", 1.0)))[:, :, None] * mask[:, :, None]
+
+        g25, rfl, gradv = self._get_grad_refl(H_spr, W_spr)
+        rgb += (g25 + rfl * wm.get("fx_refl", 36.0))[:, :, None] * mask[:, :, None]
+
+        if band.any():
+            bi = wm.get("fx_bayer", 12.0)
+            if use_big:
+                bay = self._bayer_big[:H_spr, :W_spr] * bi
+            else:
+                bb = np.array([[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]],
+                              dtype=np.float32) / 16.0 - 0.5
+                bay = np.tile(bb, (H_spr // 4 + 1, W_spr // 4 + 1))[:H_spr, :W_spr] * bi
+            rgb[band] += bay[band][:, None]
+
+        ef = wm.get("fx_echo", 0.34)
+        e1 = np.zeros_like(rgb)
+        e1[1:, 1:] = rgb[:-1, :-1] * ef
+        rgb[1:, 1:] += e1[1:, 1:]
+
+        rl = wm.get("pz_roll", 0)
+        if rl != 0:
+            rgb[:, :, 0] = np.roll(rgb[:, :, 0], rl, axis=1)
+            rgb[:, :, 2] = np.roll(rgb[:, :, 2], -rl, axis=1)
+
+        df = wm.get("fx_color_drift_freq", 0.1)
+        dp = wm.get("fx_color_drift_phase", 0.0)
+        da = wm.get("fx_color_drift_amp", 6.0)
+        drift = da * math.sin(t * df * 2 * math.pi + dp)
+        env = 0.5 + 0.5 * math.sin(t * df * math.pi + dp)
+        rgb[:, :, 0] = np.clip(rgb[:, :, 0] + drift * env, 0, 255)
+        rgb[:, :, 1] = np.clip(rgb[:, :, 1] + drift * env * 0.7, 0, 255)
+        rgb[:, :, 2] = np.clip(rgb[:, :, 2] - drift * env * 0.5, 0, 255)
+
+        morph_amp = wm.get("fx_morph_amp", 0.4)
+        morph_freq = wm.get("fx_morph_freq", 0.12)
+        morph_cycle = morph_amp * math.sin(2 * math.pi * morph_freq * t + ph2)
+        if abs(morph_cycle) > 0.1:
+            k_morph = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            if morph_cycle > 0:
+                alpha_u8 = alpha.astype(np.uint8)
+                alpha_morphed = cv2.dilate(alpha_u8, k_morph, iterations=1).astype(np.float32)
+                alpha = alpha * 0.7 + alpha_morphed * 0.3
+            else:
+                alpha_u8 = alpha.astype(np.uint8)
+                alpha_morphed = cv2.erode(alpha_u8, k_morph, iterations=1).astype(np.float32)
+                alpha = alpha * 0.7 + alpha_morphed * 0.3
+
+        gs = wm.get("fx_grad_strength", 0.4)
+        gd = wm.get("fx_grad_dir", 0)
+        if gs > 0.01:
+            if gd == 0:
+                alpha *= (1.0 - gs * gradv)
+            elif gd == 1:
+                alpha *= (1.0 - gs * (1.0 - gradv))
+            else:
+                alpha *= (1.0 - gs * (g25 / 25.0 + 0.5))
+
+        spr = np.dstack([np.clip(rgb, 0, 255).astype(np.uint8),
+                         np.clip(alpha, 0, 255).astype(np.uint8)])
+        spr = self._apply_fast_poisons(spr, frame_num)
+        return spr, nx, ny
+
+    def _init_vip(self):
+        self.vip = {"age": 0, "t": 0.0,
+                    "px": random.uniform(0, math.pi * 2), "py": random.uniform(0, math.pi * 2),
+                    "fx": random.uniform(0.3, 0.5), "fy": random.uniform(0.45, 0.75)}
+        self.vip_fx = {
+            "fx_tilt": math.radians(random.uniform(-2, 2)),
+            "fx_grow_amp": random.uniform(0.03, 0.06),
+            "fx_phase": random.uniform(0, math.pi * 2), "fx_phase2": random.uniform(0, math.pi * 2),
+            "fx_breathe_freq": random.uniform(0.6, 1.0), "fx_breathe_amp": random.uniform(0.02, 0.03),
+            "fx_erode_freq": random.uniform(0.08, 0.15),
+            "fx_nyq": random.uniform(8.0, 12.0), "fx_bayer": random.uniform(10.0, 14.0),
+            "fx_echo": random.uniform(0.28, 0.36), "fx_refl": random.uniform(30.0, 40.0),
+            "bind_gain": random.uniform(6.0, 8.0), "bind_amod": random.uniform(0.40, 0.60),
+            "fx_grad_dir": random.choice([0, 1, 2]), "fx_grad_strength": random.uniform(0.20, 0.40),
+            "fx_refl_strength": random.uniform(0.35, 0.50), "fx_refl_scale": random.uniform(0.5, 0.7),
+            "fx_refl_gap": random.uniform(2, 6),
+            "fx_refl_wave_amp": random.uniform(1.2, 2.2),
+            "fx_refl_wave_freq": random.uniform(0.10, 0.20),
+            "fx_refl_wave_speed": random.uniform(1.5, 2.5),
+            "fx_color_drift_freq": random.uniform(0.08, 0.12),
+            "fx_color_drift_phase": random.uniform(0, math.pi * 2),
+            "fx_color_drift_amp": random.uniform(4, 7),
+            "pz_rot_amp": math.radians(random.uniform(0.6, 1.2)),
+            "pz_rot_freq": random.uniform(0.08, 0.15),
+            "pz_rot_ph": random.uniform(0, math.pi * 2),
+            "pz_gam_amp": random.uniform(0.06, 0.10),
+            "pz_gam_freq": random.uniform(0.10, 0.20),
+            "pz_gam_ph": random.uniform(0, math.pi * 2),
+            "pz_nyq_sign": random.choice([-1.0, 1.0]),
+            "pz_roll": random.choice([-1, 0, 1]),
+            "pz_par_sign": 1.0,
+            "fx_morph_amp": random.uniform(0.2, 0.4),
+            "fx_morph_freq": random.uniform(0.08, 0.15),
+            "fx_lum_flick": random.uniform(0.02, 0.04),
+            "fx_lum_freq": random.uniform(0.06, 0.12),
+        }
+
+    def _process_vip(self, frame, dt, frame_num, rects):
+        sprite = self._make_sprite(self.vip_text, self.vip_font_size, bold=True)
+        if sprite is None:
+            return
+        sh, sw = sprite.shape[:2]
+        if sw > self.width - 16:
+            nw = max(40, self.width - 16)
+            nh = max(20, int(sh * nw / max(1, sw)))
+            sprite = cv2.resize(sprite, (nw, nh), interpolation=cv2.INTER_AREA)
+            sh, sw = sprite.shape[:2]
+        self.vip["age"] += 1
+        self.vip["t"] += dt
+        t = self.vip["t"]
+        alpha = 0.80 + 0.015 * math.sin(t * 0.4)
+        fade_f = max(10, int(0.8 * self.fps))
+        if self.vip["age"] < fade_f:
+            alpha *= self.vip["age"] / fade_f
+        mx, my = sw / 2 + 20, sh / 2 + 20
+        ax = max(0.0, self.width / 2 - mx); ay = max(0.0, self.height / 2 - my)
+        cx = self.width / 2 + ax * math.sin(t * self.vip["fx"] + self.vip["px"])
+        cy = self.height / 2 + ay * math.sin(t * self.vip["fy"] + self.vip["py"])
+        x = max(5, min(cx - sw / 2, self.width - sw - 5))
+        y = max(5, min(cy - sh / 2, self.height - sh - 5))
+        sprite, x, y = self._apply_text_effects(sprite, self.vip_fx, frame_num, sw, sh, x, y)
+        sh, sw = sprite.shape[:2]
+        x = max(5, min(x, self.width - sw - 5)); y = max(5, min(y, self.height - sh - 5))
+        sprite = self._adaptive_bind(sprite, self._frame_detail, self._frame_edges,
+                                     self._frame_texture, x, y,
+                                     self.vip_fx["bind_gain"], self.vip_fx["bind_amod"])
+        sprite = self._apply_edge_camouflage(sprite, self._frame_edges, self._frame_texture, x, y)
+        halo, hm = self._get_halo(self.vip_text, self.vip_font_size, bold=True)
+        if halo is not None:
+            self._blend_sprite(frame, halo, x - hm + 1, y - hm + 2, alpha)
+        self._blend_sprite(frame, sprite, x, y, alpha)
+        rects.append((int(x), int(y), sw, sh))
+        rst = self.vip_fx.get("fx_refl_strength", 0.42)
+        rsc = self.vip_fx.get("fx_refl_scale", 0.6)
+        gap = int(self.vip_fx.get("fx_refl_gap", 4))
+        r = np.flipud(sprite)
+        rh, rw = r.shape[:2]
+        nh2 = max(4, int(rh * rsc))
+        r = cv2.resize(r, (rw, nh2), interpolation=cv2.INTER_AREA)
+        rh2, rw2 = r.shape[:2]
+        wa = self.vip_fx.get("fx_refl_wave_amp", 1.6)
+        wf = self.vip_fx.get("fx_refl_wave_freq", 0.15)
+        ws = self.vip_fx.get("fx_refl_wave_speed", 2.0)
+        rows = np.arange(rh2, dtype=np.float32)
+        dxw = (wa * np.sin(rows * wf + t * ws)).astype(np.float32)
+        map_x = np.tile(np.arange(rw2, dtype=np.float32)[None, :], (rh2, 1)) + dxw[:, None]
+        map_y = np.tile(rows[:, None], (1, rw2))
+        r = cv2.remap(r, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+        fade = (np.linspace(1.0, 0.0, rh2, dtype=np.float32) ** 1.5)[:, None]
+        r[:, :, 3] = np.clip(r[:, :, 3].astype(np.float32) * fade * rst, 0, 255).astype(np.uint8)
+        self._blend_sprite(frame, r, x, y + sh + gap, alpha)
+
+    def _apply_text_parity(self, frame, rects, frame_num):
+        if not TEXT_PARITY or not rects:
+            return frame
+        H, W = frame.shape[:2]
+        for i, (rx, ry, rw, rh) in enumerate(rects):
+            x0, y0 = max(0, rx - 8), max(0, ry - 8)
+            x1, y1 = min(W, rx + rw + 8), min(H, ry + rh + 8)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            sgn = 1.0 if (i % 2 == 0) else -1.0
+            sub = self._parity1[y0:y1, x0:x1]
+            add = sgn * sub * PARITY_AMP_TEXT
+            frame[y0:y1, x0:x1] = np.clip(
+                frame[y0:y1, x0:x1].astype(np.float32) + add[:, :, None], 0, 255).astype(np.uint8)
+        return frame
+
+    def _apply_rotation(self, frame):
+        if self.rotation in (90, -270):
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        elif self.rotation in (-90, 270):
+            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        elif self.rotation == 180:
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
+        h, w = frame.shape[:2]
+        ta = self.width / max(1, self.height)
+        ca = w / max(1, h)
+        if abs(ca - ta) / max(1e-6, ta) > 0.05:
+            f90 = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+            f270 = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            ca90 = f90.shape[1] / max(1, f90.shape[0])
+            ca270 = f270.shape[1] / max(1, f270.shape[0])
+            frame = f90 if abs(ca90 - ta) <= abs(ca270 - ta) else f270
+        return frame
+
+    def process_frame(self, raw_frame, frame_num):
+        frame = self._apply_rotation(raw_frame)
+        if self.need_resize and (frame.shape[1] != self.width or frame.shape[0] != self.height):
+            frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
+        if frame.shape[1] != self.width or frame.shape[0] != self.height:
+            frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
+        out = frame
+        t = frame_num / self.fps
+        if self._frame_detail is None or (frame_num - self._maps_frame) >= 2:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            self._frame_detail = gray.astype(np.float32) - cv2.blur(gray, (5, 5)).astype(np.float32)
+            self._frame_edges = cv2.Canny(gray, 50, 150).astype(np.float32)
+            blur_small = cv2.GaussianBlur(gray, (3, 3), 0).astype(np.float32)
+            blur_large = cv2.GaussianBlur(gray, (15, 15), 0).astype(np.float32)
+            self._frame_texture = np.abs(blur_small - blur_large)
+            self._maps_frame = frame_num
+        rects = []
+        for idx, wm in enumerate(self.watermarks):
+            wm["y"] -= wm["vy_ps"] / self.fps
+            wm["age"] += 1
+            sprite = self._make_sprite(self.strong_text, wm["font_size"])
+            if sprite is None:
+                continue
+            osh, osw = sprite.shape[:2]
+            fade = self._fade_alpha(wm) / max(1e-6, wm.get("base_alpha", 1.0))
+            if wm.get("type") == "flick":
+                m = 1.0 + 0.25 * math.sin(t * wm["flick_hz"] * 2 * math.pi + wm.get("flick_phase", 0))
+                alpha = fade * wm["base_alpha"] * m
+            else:
+                wave = math.sin(2 * math.pi * t / wm["op_period"] + wm["op_phase"])
+                alpha = fade * (wm["op_mid"] + wm["op_amp"] * wave)
+            if wm.get("is_opaque", False):
+                alpha = max(0.0, min(1.0, alpha))
+            else:
+                alpha = max(0.32, min(0.90, alpha))
+            if wm["y"] < self.top_fade_margin:
+                fade_top = max(0.0, wm["y"] / self.top_fade_margin)
+                alpha *= fade_top
+            if wm["y"] <= 0 or wm["age"] > wm["life"]:
+                self.reset_watermark(idx)
+                continue
+            if alpha <= 0.01:
+                continue
+            x = wm["x"] + math.sin(t * wm.get("fx_jx_freq", 0.08) + wm.get("fx_phase", 0)) * wm.get("fx_jx_amp", 0.6)
+            y = wm["y"] + math.cos(t * wm.get("fx_jy_freq", 0.06) + wm.get("fx_phase2", 0)) * wm.get("fx_jy_amp", 0.5)
+            sprite, x, y = self._apply_text_effects(sprite, wm, frame_num, osw, osh, x, y)
+            sh, sw = sprite.shape[:2]
+            x = max(2, min(x, self.width - sw - 2)); y = max(2, min(y, self.height - sh - 2))
+            sprite = self._adaptive_bind(sprite, self._frame_detail, self._frame_edges,
+                                         self._frame_texture, x, y, wm["bind_gain"], wm["bind_amod"])
+            sprite = self._apply_edge_camouflage(sprite, self._frame_edges, self._frame_texture, x, y)
+            halo, hm = self._get_halo(self.strong_text, wm["font_size"])
+            if halo is not None:
+                hp = 1.0 + HALO_PULSE_AMP * math.sin(t * HALO_PULSE_FREQ * 2 * math.pi + wm.get("fx_phase", 0))
+                self._blend_sprite(out, halo, x - hm + 1, y - hm + 2, alpha * hp)
+            if wm.get("blend") == "overlay":
+                self._blend_sprite_overlay(out, sprite, x, y, alpha)
+            else:
+                self._blend_sprite(out, sprite, x, y, alpha)
+            rects.append((int(x), int(y), sw, sh))
+        self._process_vip(out, 1.0 / self.fps, frame_num, rects)
+        dt = 1.0 / self.fps
+        for g in self.ghosts:
+            g["y"] -= g["vy_ps"] * dt
+            g["age"] += 1
+            sprite = self._make_sprite(self.strong_text, g["font_size"])
+            if sprite is None:
+                continue
+            sh = sprite.shape[0]
+            if g["age"] > g["life"] or g["y"] < -sh - 50:
+                continue
+            ga = self._fade_alpha(g)
+            if ga <= 0.004:
+                continue
+            self._blend_sprite(out, sprite, g["x"], g["y"], ga)
+            rects.append((int(g["x"]), int(g["y"]), sprite.shape[1], sh))
+        return self._apply_text_parity(out, rects, frame_num)
+
+    def run(self, progress_cb=None, job=None):
+        n = 0
+        t0 = time.time()
+        while True:
+            ret, raw = self.cap.read()
+            if not ret:
                 break
-                
-            except FloodWait as e:
-                print(f"⚠️ حظر مؤقت لـ {e.value} ثانية...")
-                await asyncio.sleep(e.value + 2)
-                retry_count += 1
-            except Exception as inner_e:
-                print(f"❌ خطأ في الرسالة {current_id}: {inner_e}")
-                for f in files_to_delete:
-                    if f and os.path.exists(f): os.remove(f)
-                if file_path and os.path.exists(file_path): os.remove(file_path)
-                if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
-                
-                retry_count += 1
-                await asyncio.sleep(2)
-                
-    await notification.edit_text(f"🎉 تمت العملية بنجاح!\n✅ تم سحب وإرسال {success_count} ملف.")
+            n += 1
+            self.enc.write(self.process_frame(raw, n))
+            if progress_cb is not None and n % 20 == 0:
+                progress_cb(n, self.total_frames)
+        if progress_cb is not None:
+            progress_cb(self.total_frames, self.total_frames)
+        self.cap.release()
+        self.enc.close()
+        return time.time() - t0
+
+
+from pyrogram import Client, filters
+from pyrogram.types import Message
+
+app = Client("watermark_bot", api_id=API_ID, api_hash=API_HASH,
+             bot_token=BOT_TOKEN, workdir=TEMP_DIR, in_memory=True)
+MAX_SIZE = 500 * 1024 * 1024
+JOB_QUEUE = asyncio.Queue()
+
+
+def bar(pct, length=12):
+    pct = max(0.0, min(1.0, pct))
+    f = int(round(pct * length))
+    return "█" * f + "░" * (length - f)
+
+
+def fmt_time(s):
+    s = max(0, int(s))
+    return f"{s // 60:02d}:{s % 60:02d}"
+
+
+async def progress_updater(job):
+    msg = job["status_msg"]
+    while not job["done"]:
+        await asyncio.sleep(PROGRESS_INTERVAL)
+        if job["done"]:
+            break
+        stage = job.get("stage", "watermark")
+        if stage == "download":
+            text = "⬇️ تحميل...\n📊 [░░░░░░░░░░░░]"
+        elif stage == "watermark":
+            n = job.get("frames_done", 0)
+            total = max(1, job.get("frames_total", 1))
+            pct = min(1.0, n / total)
+            el = time.time() - job.get("t0", time.time())
+            eta = (el / max(pct, 0.02)) * (1 - pct) if pct > 0.02 else 0
+            text = (f"🎬 معالجة {job.get('dims', '')}...\n📊 [{bar(pct)}] {pct*100:.0f}%\n"
+                    f"🎞 فريم: {n}/{total}\n⏱ مضى: {fmt_time(el)} | المتبقي: ~{fmt_time(eta)}\n"
+                    f"📚 منتظرين: {JOB_QUEUE.qsize()}")
+        elif stage == "finish":
+            text = "📦 إنهاء الترميز...\n📊 [████████████] 99%"
+        elif stage == "upload":
+            text = "📤 إرسال...\n📊 [████████████] 100%"
+        else:
+            text = "⏳ بالطابور..."
+        try:
+            await msg.edit_text(text)
+        except Exception:
+            pass
+
+
+async def process_job(job):
+    message, msg, uid = job["message"], job["status_msg"], job["uid"]
+    inp = os.path.join(TEMP_DIR, f"in_{uid}.mp4")
+    out = os.path.join(TEMP_DIR, f"out_{uid}.mp4")
+    try:
+        job["stage"] = "download"
+        await message.download(file_name=inp)
+        if not os.path.exists(inp) or os.path.getsize(inp) == 0:
+            await msg.edit_text("❌ فشل تحميل الفيديو")
+            return
+        cap_t = cv2.VideoCapture(inp)
+        info = extract_info(probe_video(inp), cap_t)
+        cap_t.release()
+        job["dims"] = f"{info['true_w']}x{info['true_h']}"
+        job["stage"] = "watermark"
+        job["frames_done"] = 0
+        job["t0"] = time.time()
+        w = FloatingWatermark(inp, out, audio_src=inp)
+        job["frames_total"] = w.total_frames
+
+        def cb(n, total):
+            job["frames_done"], job["frames_total"] = n, total
+
+        updater = asyncio.create_task(progress_updater(job))
+        elapsed = await asyncio.to_thread(w.run, cb, job)
+        job["stage"] = "finish"
+        job["done"] = True
+        try:
+            await asyncio.wait_for(updater, timeout=PROGRESS_INTERVAL + 2)
+        except Exception:
+            updater.cancel()
+        if not os.path.exists(out) or os.path.getsize(out) == 0:
+            await msg.edit_text("❌ فشل إنشاء الفيديو")
+            return
+        sz = os.path.getsize(out) / (1024 ** 2)
+        if sz > 500:
+            await msg.edit_text(f"❌ الحجم {sz:.1f}MB أكبر من 500MB")
+            return
+        job["stage"] = "upload"
+        await message.reply_video(out, caption=(
+            "✓ تمت إضافة الحقوق 🎬\n\n"
+            "⬆️ 40 نص صغير واضح للقراءة\n"
+            "🛡️ حماية قوية ضد dewatermark.ai\n"
+            "📐 بدون سترتش\n\n"
+            f"📐 {w.width}x{w.height} | rot {w.rotation}°\n"
+            f"🎞 CRF {ENCODE_CRF} | maxrate {w.maxrate}\n"
+            f"⏱ المعالجة: {fmt_time(elapsed)}"))
+        await msg.edit_text(f"✅ انتهى!\n⏱ {fmt_time(elapsed)}\n💾 {sz:.1f}MB\n📚 بالانتظار: {JOB_QUEUE.qsize()}")
+    except Exception as e:
+        print(f"❌ خطأ: {e}")
+        try:
+            await msg.edit_text(f"❌ خطأ: {e}")
+        except Exception:
+            pass
+    finally:
+        for p in (inp, out):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
+
+async def worker():
+    while True:
+        job = await JOB_QUEUE.get()
+        try:
+            await job["status_msg"].edit_text(f"🚀 بدأنا فيديوك!\n📚 متبقين: {JOB_QUEUE.qsize()}")
+        except Exception:
+            pass
+        try:
+            await process_job(job)
+        except Exception as e:
+            print(f"❌ worker: {e}")
+        finally:
+            JOB_QUEUE.task_done()
+
+
+@app.on_message(filters.command("start"))
+async def start(c, m):
+    await m.reply("👋 هلا! 🎬\n\nأرسل فيديو وأضيف الحقوق:\n\n"
+                  "⬆️ 40 نص صغير واضح للقراءة\n"
+                  "🛡️ حماية قوية ضد dewatermark.ai\n"
+                  "📐 بدون سترتش\n"
+                  "👁 راحة عين | 🚀 سرعة عالية")
+
+
+@app.on_message(filters.video)
+async def on_video(c, m):
+    if m.video and m.video.file_size and m.video.file_size > MAX_SIZE:
+        await m.reply("❌ أكبر من 500MB")
+        return
+    if JOB_QUEUE.qsize() >= MAX_QUEUE:
+        await m.reply(f"😅 الطابور ممتلئ ({JOB_QUEUE.qsize()}/{MAX_QUEUE})")
+        return
+    pos = JOB_QUEUE.qsize() + 1
+    msg = await m.reply(f"✅ استلمت فيديوك!\n📚 ترتيبك: #{pos}\n⏳ سأبدأ فور انتهاء من قبلك")
+    await JOB_QUEUE.put({"message": m, "status_msg": msg, "uid": uuid.uuid4().hex[:8],
+                         "stage": "queued", "done": False,
+                         "frames_done": 0, "frames_total": 1, "t0": None, "dims": ""})
+
+
+@app.on_message(filters.command("status"))
+async def status(c, m):
+    await m.reply(f"📚 بالطابور: {JOB_QUEUE.qsize()}\n🎞 CRF {ENCODE_CRF}\n🏭 شغال")
+
+
+async def main():
+    print("🤖 تشغيل البوت...")
+    await app.start()
+    print("✓ البوت شغال")
+    asyncio.create_task(worker())
+    try:
+        from pyrogram import idle
+        await idle()
+    except ImportError:
+        await asyncio.Event().wait()
+
 
 if __name__ == "__main__":
-    Thread(target=run_web_server).start()
-    app.run()
+    asyncio.run(main())
