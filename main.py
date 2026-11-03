@@ -219,8 +219,10 @@ class FloatingWatermark:
         print(f"🎞 {self.src_w}x{self.src_h} rot={self.rotation} → {self.width}x{self.height} @ {self.fps:.2f} maxrate={self.maxrate}")
         self.enc = PipeEncoder(self.width, self.height, self.fps, output_path,
                                audio_src, "1:1", ENCODE_CRF, ENCODE_PRESET, self.maxrate)
-        self.strong_text = "Tel:@vamp1r3s"
+        # ✅ 3 نصوص مختلفة = كسر تطابق القالب عند الكاشف
+        self.text_variants = ["Tel:@vamp1r3s", "@vamp1r3s", "t.me/vamp1r3s"]
         self.vip_text = "Telegram:@vamp1r3s"
+        self.vip_vary = random.randint(1, 10**9)
         self.font_path = self._get_font_path()
         self.bold_font_path = self._get_bold_font_path()
         self.use_pil = (self.font_path is not None) or (self.bold_font_path is not None)
@@ -232,7 +234,7 @@ class FloatingWatermark:
         old_max = max(old_min + 4, int(base * 0.040))
         strong_min = max(12, int(old_min * 0.55))
         strong_max = max(strong_min + 4, int(old_max * 0.55))
-        max_strong_w = int((self.width * 0.90) / max(10, len(self.strong_text) * 0.60))
+        max_strong_w = int((self.width * 0.90) / max(10, len(self.strong_text if hasattr(self, 'strong_text') else "Tel:@vamp1r3s") * 0.60))
         strong_max = max(strong_min + 4, min(strong_max, max_strong_w))
         vip_size = max(strong_max + 6, int(base * 0.062))
         max_vip_w = int((self.width * 0.92) / max(10, len(self.vip_text) * 0.68))
@@ -269,6 +271,10 @@ class FloatingWatermark:
         self._init_vip()
         self.ghosts = []
         self._init_ghosts()
+
+    @property
+    def strong_text(self):
+        return self.text_variants[0]
 
     def _get_font_path(self):
         for p in [os.path.join(TEMP_DIR, "Poppins-Medium.ttf"),
@@ -316,29 +322,65 @@ class FloatingWatermark:
             self._grad_cache[key] = gr
         return gr
 
-    def _make_sprite(self, text, font_size, bold=False):
+    # ✅ رسم حرف-بحرف مع تشويش شكل كل نسخة = كسر تطابق القالب
+    def _make_sprite(self, text, font_size, bold=False, vary_seed=None):
         path = self.bold_font_path if bold else self.font_path
         if not self.use_pil or not path:
             return None
-        key = (text, int(font_size), bold)
+        key = (text, int(font_size), bold, vary_seed)
         if key in self._sprite_cache:
             return self._sprite_cache[key]
         font = self._get_font(font_size)
         if font is None:
             return None
         pad = max(6, int(font_size * 0.25))
-        tmp = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
-        dr = ImageDraw.Draw(tmp)
-        try:
-            bbox = dr.textbbox((0, 0), text, font=font)
-        except Exception:
-            bbox = (0, 0, int(font_size * 0.6 * len(text)), int(font_size))
-        tw = max(4, bbox[2] - bbox[0]); th = max(4, bbox[3] - bbox[1])
-        img = Image.new("RGBA", (tw + pad * 2, th + pad * 2), (0, 0, 0, 0))
-        dr = ImageDraw.Draw(img)
-        dr.text((pad - bbox[0], pad - bbox[1]), text, font=font, fill=(0, 0, 0, 255))
+        if vary_seed is None:
+            tmp = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
+            dr = ImageDraw.Draw(tmp)
+            try:
+                bbox = dr.textbbox((0, 0), text, font=font)
+            except Exception:
+                bbox = (0, 0, int(font_size * 0.6 * len(text)), int(font_size))
+            tw = max(4, bbox[2] - bbox[0]); th = max(4, bbox[3] - bbox[1])
+            img = Image.new("RGBA", (tw + pad * 2, th + pad * 2), (0, 0, 0, 0))
+            dr = ImageDraw.Draw(img)
+            dr.text((pad - bbox[0], pad - bbox[1]), text, font=font, fill=(0, 0, 0, 255))
+        else:
+            rng = random.Random(vary_seed)
+            chars = []
+            total_w = 0
+            max_h = 0
+            for ch in text:
+                try:
+                    bb = font.getbbox(ch)
+                except Exception:
+                    bb = None
+                if bb is None:
+                    bb = (0, 0, 0, 0)
+                adv = int(font.getlength(ch))
+                dy = rng.randint(-2, 2)
+                dsp = rng.randint(-1, 1)
+                chars.append((ch, bb, adv, dy, dsp))
+                max_h = max(max_h, bb[3] - bb[1])
+                total_w += adv + dsp
+            tw = max(4, total_w); th = max(4, max_h + 6)
+            img = Image.new("RGBA", (tw + pad * 2, th + pad * 2), (0, 0, 0, 0))
+            dr = ImageDraw.Draw(img)
+            cx = pad
+            base_y = pad + 3
+            for ch, bb, adv, dy, dsp in chars:
+                dr.text((cx - bb[0], base_y - bb[1] + dy), ch, font=font, fill=(0, 0, 0, 255))
+                cx += adv + dsp
+            arr0 = np.array(img)
+            a0 = arr0[:, :, 3]
+            k = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+            a0 = cv2.erode(a0, k, 1) if rng.random() < 0.5 else cv2.dilate(a0, k, 1)
+            arr0[:, :, 3] = a0
+            img = Image.fromarray(arr0)
         arr = np.array(img)
         sprite = arr[:, :, [2, 1, 0, 3]].copy()
+        if len(self._sprite_cache) > 400:
+            self._sprite_cache.clear()
         self._sprite_cache[key] = sprite
         return sprite
 
@@ -460,7 +502,9 @@ class FloatingWatermark:
                 "base_alpha": random.uniform(0.030, 0.055), "life": life,
                 "age": random.randint(0, max(1, int(0.5 * self.fps))),
                 "fade_in": max(8, int(self.fps)), "fade_out": max(8, int(1.5 * self.fps)),
-                "bind_gain": random.uniform(3.5, 5.0), "bind_amod": random.uniform(0.20, 0.35)}
+                "bind_gain": random.uniform(3.5, 5.0), "bind_amod": random.uniform(0.20, 0.35),
+                "text_idx": random.randint(0, 2), "vary_seed": random.randint(1, 10**9),
+                "bold_inst": False}
 
     def _fade_alpha(self, wm):
         base = wm.get("base_alpha", 1.0)
@@ -544,10 +588,9 @@ class FloatingWatermark:
         pz_gam_amp = random.uniform(0.08, 0.13)
         is_opaque = False
 
+        # ✅ شفافية مرفوعة: الخلفية ما تبين من ورا النص = ترميم أصعب
         prof = random.random()
         if prof < 0.30:
-            op_mid, op_amp = random.uniform(0.38, 0.50), random.uniform(0.10, 0.16)
-        elif prof < 0.60:
             op_mid, op_amp = 1.0, 0.0
             is_opaque = True
             fx_nyq = random.uniform(14.0, 22.0)
@@ -557,9 +600,14 @@ class FloatingWatermark:
             bind_amod = random.uniform(0.35, 0.50)
             pz_rot_amp = math.radians(random.uniform(1.2, 2.0))
             pz_gam_amp = random.uniform(0.12, 0.18)
+        elif prof < 0.65:
+            op_mid, op_amp = random.uniform(0.65, 0.85), random.uniform(0.05, 0.09)
+            fx_nyq = random.uniform(14.0, 22.0)
+            fx_bayer = random.uniform(16.0, 24.0)
+            bind_gain = random.uniform(4.5, 6.5)
+            bind_amod = random.uniform(0.30, 0.45)
         else:
-            op_mid = random.uniform(0.40, 0.80)
-            op_amp = random.uniform(0.10, 0.25)
+            op_mid, op_amp = random.uniform(0.45, 0.65), random.uniform(0.06, 0.10)
             fx_nyq = random.uniform(15.0, 24.0)
             fx_bayer = random.uniform(18.0, 26.0)
             fx_echo = random.uniform(0.50, 0.70)
@@ -578,6 +626,9 @@ class FloatingWatermark:
 
         return {
             "type": wm_type, "blend": blend,
+            "text_idx": random.randint(0, len(self.text_variants) - 1),
+            "vary_seed": random.randint(1, 10**9),
+            "bold_inst": random.random() < 0.5,
             "x": x, "y": y, "vy_ps": vy_ps, "vx_ps": 0.0,
             "fx_tilt": math.radians(random.uniform(-3, 3)),
             "fx_grow_amp": random.uniform(0.06, 0.14),
@@ -623,6 +674,7 @@ class FloatingWatermark:
         old = self.watermarks[idx].get("type", "strong")
         self.watermarks[idx] = self._make_watermark(old)
 
+    # ✅ سموم + وميض حواف عشوائي كل فريم = كسر التتبع الزمني للقناع
     def _apply_fast_poisons(self, spr, frame_num):
         if spr is None:
             return spr
@@ -643,14 +695,20 @@ class FloatingWatermark:
         k_edge = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
         edge_mask = cv2.dilate(a8, k_edge, iterations=1) - cv2.erode(a8, k_edge, iterations=1)
         edge_mask = (edge_mask > 10) & mask
+        # ✅ وميض حواف: تآكل/تمدد عشوائي كل فريم على الحواف فقط
+        k_s = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        sh_a = cv2.erode(a8, k_s, 1) if np.random.rand() < 0.5 else cv2.dilate(a8, k_s, 1)
+        band = (np.abs(a8.astype(np.int16) - sh_a.astype(np.int16)) > 15).astype(np.float32)
+        a_mix = (0.55 * a8.astype(np.float32) + 0.45 * sh_a.astype(np.float32))
+        a8 = np.where(band > 0, a_mix.astype(np.uint8), a8)
         if edge_mask.any():
-            edge_noise = np.random.randint(-8, 9, size=(H, W, 3), dtype=np.int16)
+            edge_noise = np.random.randint(-10, 11, size=(H, W, 3), dtype=np.int16)
             edge_mask3 = np.stack([edge_mask]*3, axis=-1)
             spr_int16 = spr[:, :, :3].astype(np.int16)
             spr_int16 += (edge_noise * edge_mask3)
             spr[:, :, :3] = np.clip(spr_int16, 0, 255).astype(np.uint8)
-        alpha_int16 = alpha.astype(np.int16)
-        alpha_edge_noise = np.random.randint(-6, 7, size=(H, W), dtype=np.int16)
+        alpha_int16 = a8.astype(np.int16)
+        alpha_edge_noise = np.random.randint(-10, 11, size=(H, W), dtype=np.int16)
         alpha_int16 += (alpha_edge_noise * edge_mask)
         spr[:, :, 3] = np.clip(alpha_int16, 0, 255).astype(np.uint8)
         return spr
@@ -840,7 +898,8 @@ class FloatingWatermark:
         }
 
     def _process_vip(self, frame, dt, frame_num, rects):
-        sprite = self._make_sprite(self.vip_text, self.vip_font_size, bold=True)
+        sprite = self._make_sprite(self.vip_text, self.vip_font_size, bold=True,
+                                   vary_seed=self.vip_vary)
         if sprite is None:
             return
         sh, sw = sprite.shape[:2]
@@ -852,7 +911,7 @@ class FloatingWatermark:
         self.vip["age"] += 1
         self.vip["t"] += dt
         t = self.vip["t"]
-        alpha = 0.80 + 0.015 * math.sin(t * 0.4)
+        alpha = 0.85 + 0.015 * math.sin(t * 0.4)
         fade_f = max(10, int(0.8 * self.fps))
         if self.vip["age"] < fade_f:
             alpha *= self.vip["age"] / fade_f
@@ -948,7 +1007,10 @@ class FloatingWatermark:
         for idx, wm in enumerate(self.watermarks):
             wm["y"] -= wm["vy_ps"] / self.fps
             wm["age"] += 1
-            sprite = self._make_sprite(self.strong_text, wm["font_size"])
+            txt = self.text_variants[wm.get("text_idx", 0)]
+            sprite = self._make_sprite(txt, wm["font_size"],
+                                       bold=wm.get("bold_inst", False),
+                                       vary_seed=wm.get("vary_seed"))
             if sprite is None:
                 continue
             osh, osw = sprite.shape[:2]
@@ -962,7 +1024,7 @@ class FloatingWatermark:
             if wm.get("is_opaque", False):
                 alpha = max(0.0, min(1.0, alpha))
             else:
-                alpha = max(0.32, min(0.90, alpha))
+                alpha = max(0.45, min(0.95, alpha))
             if wm["y"] < self.top_fade_margin:
                 fade_top = max(0.0, wm["y"] / self.top_fade_margin)
                 alpha *= fade_top
@@ -979,7 +1041,7 @@ class FloatingWatermark:
             sprite = self._adaptive_bind(sprite, self._frame_detail, self._frame_edges,
                                          self._frame_texture, x, y, wm["bind_gain"], wm["bind_amod"])
             sprite = self._apply_edge_camouflage(sprite, self._frame_edges, self._frame_texture, x, y)
-            halo, hm = self._get_halo(self.strong_text, wm["font_size"])
+            halo, hm = self._get_halo(txt, wm["font_size"], bold=wm.get("bold_inst", False))
             if halo is not None:
                 hp = 1.0 + HALO_PULSE_AMP * math.sin(t * HALO_PULSE_FREQ * 2 * math.pi + wm.get("fx_phase", 0))
                 self._blend_sprite(out, halo, x - hm + 1, y - hm + 2, alpha * hp)
@@ -993,7 +1055,10 @@ class FloatingWatermark:
         for g in self.ghosts:
             g["y"] -= g["vy_ps"] * dt
             g["age"] += 1
-            sprite = self._make_sprite(self.strong_text, g["font_size"])
+            gtxt = self.text_variants[g.get("text_idx", 0)]
+            sprite = self._make_sprite(gtxt, g["font_size"],
+                                       bold=g.get("bold_inst", False),
+                                       vary_seed=g.get("vary_seed"))
             if sprite is None:
                 continue
             sh = sprite.shape[0]
@@ -1115,9 +1180,10 @@ async def process_job(job):
         job["stage"] = "upload"
         await message.reply_video(out, caption=(
             "✓ تمت إضافة الحقوق 🎬\n\n"
-            "⬆️ 40 نص صغير واضح للقراءة\n"
-            "🛡️ حماية قوية ضد dewatermark.ai\n"
-            "📐 بدون سترتش\n\n"
+            "🧬 40 نص بأشكال حروف مختلفة لكل واحد\n"
+            "⬆️ شفافية مرفوعة = ترميم أصعب على AI\n"
+            "🌀 وميض حواف مجهري يكسر التتبع الزمني\n"
+            "🛡️ 3 نصوص مختلفة = ما فيه قالب واحد\n\n"
             f"📐 {w.width}x{w.height} | rot {w.rotation}°\n"
             f"🎞 CRF {ENCODE_CRF} | maxrate {w.maxrate}\n"
             f"⏱ المعالجة: {fmt_time(elapsed)}"))
@@ -1155,10 +1221,10 @@ async def worker():
 @app.on_message(filters.command("start"))
 async def start(c, m):
     await m.reply("👋 هلا! 🎬\n\nأرسل فيديو وأضيف الحقوق:\n\n"
-                  "⬆️ 40 نص صغير واضح للقراءة\n"
-                  "🛡️ حماية قوية ضد dewatermark.ai\n"
-                  "📐 بدون سترتش\n"
-                  "👁 راحة عين | 🚀 سرعة عالية")
+                  "🧬 40 نص بأشكال حروف مختلفة لكل نسخة\n"
+                  "⬆️ شفافية مرفوعة = ترميم أصعب على AI\n"
+                  "🌀 وميض حواف مجهري يكسر التتبع الزمني\n"
+                  "📐 بدون سترتش | 👁 راحة عين | 🚀 سريع")
 
 
 @app.on_message(filters.video)
@@ -1184,7 +1250,7 @@ async def status(c, m):
 async def main():
     print("🤖 تشغيل البوت...")
     await app.start()
-    print("✓ البوت شغال")
+    print("✓ البوت شغال | كسر القالب + شفافية مرفوعة + وميض حواف")
     asyncio.create_task(worker())
     try:
         from pyrogram import idle
