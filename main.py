@@ -33,7 +33,7 @@ if not API_ID or not API_HASH or not BOT_TOKEN:
     raise ValueError("⚠️ عبّئ المتغيرات في Railway: API_ID, API_HASH, BOT_TOKEN")
 
 ENCODE_CRF = 18
-ENCODE_PRESET = "veryfast"
+ENCODE_PRESET = "superfast"
 TIME_HARD_SEC = 29 * 60
 
 STRONG_COUNT = 40
@@ -77,9 +77,10 @@ def probe_video(path):
     return None
 
 
-def extract_geometry(probe_res):
-    out = {"w0": 1280, "h0": 720, "sar_str": "1:1", "sar_val": 1.0, "rot": 0,
-           "fps": 30.0, "total": 0, "bitrate": 0}
+def extract_info(probe_res):
+    # ✅ نقرأ فقط: الأبعاد المخزنة + تدوير مصفوفة العرض + fps + عدد + بتريت
+    # ❌ لا SAR، لا وسوم rotate، لا حسابات عرض — أبداً
+    out = {"w0": 720, "h0": 1280, "rot": 0, "fps": 30.0, "total": 0, "bitrate": 0}
     if probe_res is None:
         return out
     vs = None
@@ -89,20 +90,7 @@ def extract_geometry(probe_res):
             break
     if vs is None:
         return out
-    w0 = int(vs.get("width", 1280)); h0 = int(vs.get("height", 720))
-    sar_str = vs.get("sample_aspect_ratio", "1:1") or "1:1"
-    sar_val = 1.0
-    if ":" in sar_str:
-        try:
-            n, d = sar_str.split(":")
-            sar_val = float(n) / float(d) if float(d) else 1.0
-        except Exception:
-            sar_val = 1.0
-    else:
-        try:
-            sar_val = float(sar_str) or 1.0
-        except Exception:
-            sar_val = 1.0
+    w0 = int(vs.get("width", 720)); h0 = int(vs.get("height", 1280))
     rot = 0
     for sd in vs.get("side_data_list", []):
         if "rotation" in sd:
@@ -136,14 +124,24 @@ def extract_geometry(probe_res):
         br = int(probe_res.get("format", {}).get("bit_rate", 0) or 0)
     except Exception:
         pass
-    out.update({"w0": w0, "h0": h0, "sar_str": sar_str, "sar_val": sar_val,
-                "rot": rot, "fps": fps, "total": total, "bitrate": br})
+    out.update({"w0": w0, "h0": h0, "rot": rot, "fps": fps, "total": total, "bitrate": br})
     return out
+
+
+def rot_vf(rot):
+    # ✅ تدوير قياسي مطابق لمصفوفة العرض (نفس سلوك تيليجرام)
+    if rot in (90, -270):
+        return "transpose=1"
+    if rot in (180, -180):
+        return "transpose=1,transpose=1"
+    if rot in (270, -90):
+        return "transpose=2"
+    return None
 
 
 class PipeEncoder:
     def __init__(self, width, height, fps, out_path, audio_src,
-                 sar_str="1:1", rot=0, crf=ENCODE_CRF, preset=ENCODE_PRESET, maxrate=None):
+                 crf=ENCODE_CRF, preset=ENCODE_PRESET, maxrate=None):
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
                "-f", "rawvideo", "-pix_fmt", "bgr24",
                "-s", f"{width}x{height}", "-r", f"{fps:.6f}", "-i", "pipe:0"]
@@ -152,13 +150,11 @@ class PipeEncoder:
         cmd += ["-map", "0:v:0"]
         if audio_src and os.path.exists(audio_src):
             cmd += ["-map", "1:a:0?"]
-        # ✅ ترميز خفيف سريع: ref=1 + dia + subme=2 + بدون trellis = 2-3 أضعاف سرعة
+        # ✅ سريع كفاية يلحق بالمعالجة: superfast + subme=1 + ref=1
         cmd += ["-c:v", "libx264", "-crf", str(crf), "-preset", preset,
                 "-pix_fmt", "yuv420p", "-profile:v", "high",
-                "-vf", f"setsar={sar_str}",
-                "-x264-params", "aq-mode=3:aq-strength=0.9:ref=1:me=dia:subme=2:trellis=0:threads=0"]
-        if rot:
-            cmd += ["-metadata:s:v:0", f"rotate={rot}"]
+                "-vf", "setsar=1:1",
+                "-x264-params", "aq-mode=3:aq-strength=0.9:ref=1:me=dia:subme=1:trellis=0:threads=0"]
         if maxrate:
             cmd += ["-maxrate", maxrate, "-bufsize", str(int(maxrate.replace("M", "")) * 2) + "M"]
         if audio_src and os.path.exists(audio_src):
@@ -190,45 +186,43 @@ class FloatingWatermark:
         self.video_path = video_path
         self.output_path = output_path
         self.audio_src = audio_src
-        g = extract_geometry(probe_video(video_path))
-        self.coded_w, self.coded_h = g["w0"], g["h0"]
-        self.sar_str, self.sar_val, self.rot = g["sar_str"], g["sar_val"], g["rot"]
-        self.fps = g["fps"] if g["fps"] > 0 else 30.0
-        self.src_bitrate = g["bitrate"]
-        ws = int(round(self.coded_w * self.sar_val))
-        if self.rot in (90, 270):
-            self.width, self.height = self.coded_h, ws
+        info = extract_info(probe_video(video_path))
+        self.fps = info["fps"] if info["fps"] > 0 else 30.0
+        self.src_bitrate = info["bitrate"]
+        # ✅ أبعاد العرض = المخزنة مبدلة بتدوير مصفوفة العرض فقط (لا SAR)
+        if info["rot"] in (90, 270):
+            self.width, self.height = info["h0"], info["w0"]
         else:
-            self.width, self.height = ws, self.coded_h
+            self.width, self.height = info["w0"], info["h0"]
         self.width += self.width % 2
         self.height += self.height % 2
-        # ✅ إذا ما فيه SAR/تدوير/فرق أبعاد → التحويلات تصير no-op بدون نسخ
-        self.geo_active = (abs(self.sar_val - 1.0) > 0.001) or (self.rot != 0) or \
-                          (self.width != self.coded_w) or (self.height != self.coded_h)
 
+        # ✅ فك خام: تدوير قياسي فقط، بدون scale، بدون sar، بدون autorotate مزدوج
+        vf = rot_vf(info["rot"])
+        vf = f"{vf},format=bgr24" if vf else "format=bgr24"
         self.raw_path = output_path + ".raw"
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-noautorotate",
-               "-i", video_path, "-vf", "format=bgr24",
+               "-i", video_path, "-vf", vf,
                "-f", "rawvideo", "-y", self.raw_path]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=TIME_HARD_SEC)
         if r.returncode != 0 or not os.path.exists(self.raw_path):
             raise ValueError(f"❌ فشل فك الفيديو: {r.stderr[-300:]}")
-        self.frame_bytes = self.coded_w * self.coded_h * 3
+        self.frame_bytes = self.width * self.height * 3
         sz = os.path.getsize(self.raw_path)
         self.total_frames = sz // self.frame_bytes
         if self.total_frames <= 0:
             raise ValueError("❌ ملف الفيديو الخام فاضي")
-        if g["total"] > 0:
-            self.total_frames = min(self.total_frames, g["total"] + 2)
+        if info["total"] > 0:
+            self.total_frames = min(self.total_frames, info["total"] + 2)
         self.raw_f = open(self.raw_path, "rb")
-        print(f"✅ مخزن: {self.coded_w}x{self.coded_h} sar={self.sar_str} rot={self.rot} | عرض: {self.width}x{self.height} | geo={self.geo_active} | فريمات: {self.total_frames}")
+        print(f"✅ نهائي: {self.width}x{self.height} | rot={info['rot']} | فريمات: {self.total_frames} @ {self.fps:.2f}")
 
         br_m = self.src_bitrate / 1_000_000 if self.src_bitrate else 0
         cap_m = max(6.0, min(12.0, br_m * 2.2)) if br_m > 0 else 8.0
         self.maxrate = f"{cap_m:.0f}M"
-        self.enc = PipeEncoder(self.coded_w, self.coded_h, self.fps, output_path,
-                               audio_src, self.sar_str, self.rot,
-                               ENCODE_CRF, ENCODE_PRESET, self.maxrate)
+        # ✅ ترميز بنفس الأبعاد بالضبط، sar 1:1، بدون أي metadata تدوير
+        self.enc = PipeEncoder(self.width, self.height, self.fps, output_path,
+                               audio_src, ENCODE_CRF, ENCODE_PRESET, self.maxrate)
         self.text_variants = ["Tel:@vamp1r3s"]
         self.vip_text = "Telegram:@vamp1r3s"
         self.vip_vary = random.randint(1, 10**9)
@@ -281,38 +275,21 @@ class FloatingWatermark:
         self.ghosts = []
         self._init_ghosts()
 
-    def _to_display(self, f):
-        if not self.geo_active:
-            return f
-        if abs(self.sar_val - 1.0) > 0.001:
-            ws = int(round(self.coded_w * self.sar_val))
-            f = cv2.resize(f, (ws, self.coded_h), interpolation=cv2.INTER_LINEAR)
-        if self.rot == 90:
-            f = cv2.rotate(f, cv2.ROTATE_90_CLOCKWISE)
-        elif self.rot == 180:
-            f = cv2.rotate(f, cv2.ROTATE_180)
-        elif self.rot == 270:
-            f = cv2.rotate(f, cv2.ROTATE_90_COUNTERCLOCKWISE)
-        if f.shape[1] != self.width or f.shape[0] != self.height:
-            f = cv2.resize(f, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
-        return f
-
-    def _to_coded(self, f):
-        if not self.geo_active:
-            return f
-        if self.rot == 90:
-            f = cv2.rotate(f, cv2.ROTATE_90_COUNTERCLOCKWISE)
-        elif self.rot == 180:
-            f = cv2.rotate(f, cv2.ROTATE_180)
-        elif self.rot == 270:
-            f = cv2.rotate(f, cv2.ROTATE_90_CLOCKWISE)
-        if f.shape[1] != self.coded_w or f.shape[0] != self.coded_h:
-            f = cv2.resize(f, (self.coded_w, self.coded_h), interpolation=cv2.INTER_LINEAR)
-        return f
-
     @property
     def strong_text(self):
         return self.text_variants[0]
+
+    def close(self):
+        try:
+            if self.raw_f:
+                self.raw_f.close()
+        except Exception:
+            pass
+        try:
+            if os.path.exists(self.raw_path):
+                os.remove(self.raw_path)
+        except Exception:
+            pass
 
     def _get_font_path(self):
         for p in [os.path.join(TEMP_DIR, "Poppins-Medium.ttf"),
@@ -999,15 +976,14 @@ class FloatingWatermark:
                 frame[y0:y1, x0:x1].astype(np.float32) + add[:, :, None], 0, 255).astype(np.uint8)
         return frame
 
-    def process_frame(self, coded_frame, frame_num):
-        frame = self._to_display(coded_frame)
+    def process_frame(self, frame, frame_num):
+        # ✅ الفريم داخل بأبعاد العرض النهائية — ما نغير أبعاد أبداً من هنا للنهاية
         out = frame
-        blur_s = cv2.GaussianBlur(out, (0, 0), 1.1)
-        out = np.clip(out.astype(np.float32) * 1.32 - blur_s.astype(np.float32) * 0.32,
+        blur_s = cv2.blur(out, (3, 3))
+        out = np.clip(out.astype(np.float32) * 1.30 - blur_s.astype(np.float32) * 0.30,
                       0, 255).astype(np.uint8)
         t = frame_num / self.fps
-        # ✅ خرائط كل 3 فريمات (توفير وقت بدون أثر مرئي)
-        if self._frame_detail is None or (frame_num - self._maps_frame) >= 3:
+        if self._frame_detail is None or (frame_num - self._maps_frame) >= 4:
             gray = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
             self._frame_detail = gray.astype(np.float32) - cv2.blur(gray, (5, 5)).astype(np.float32)
             self._frame_edges = cv2.Canny(gray, 50, 150).astype(np.float32)
@@ -1078,8 +1054,7 @@ class FloatingWatermark:
                 continue
             self._blend_sprite(out, sprite, g["x"], g["y"], ga)
             rects.append((int(g["x"]), int(g["y"]), sprite.shape[1], sh))
-        out = self._apply_text_parity(out, rects, frame_num)
-        return self._to_coded(out)
+        return self._apply_text_parity(out, rects, frame_num)
 
     def run(self, progress_cb=None, job=None):
         n = 0
@@ -1088,7 +1063,7 @@ class FloatingWatermark:
             buf = self.raw_f.read(self.frame_bytes)
             if len(buf) < self.frame_bytes:
                 break
-            frame = np.frombuffer(buf, dtype=np.uint8).reshape(self.coded_h, self.coded_w, 3)
+            frame = np.frombuffer(buf, dtype=np.uint8).reshape(self.height, self.width, 3)
             n += 1
             self.enc.write(self.process_frame(frame, n))
             if progress_cb is not None and n % 20 == 0:
@@ -1189,12 +1164,12 @@ async def process_job(job):
         job["stage"] = "upload"
         await message.reply_video(out, caption=(
             "✓ تمت إضافة الحقوق 🎬\n\n"
-            "📐 حاوية مطابقة للأصل (أبعاد+SAR+تدوير منسوخة)\n"
+            "📐 نفس أبعاد عرض مقطعك (تدوير قياسي فقط، بدون SAR)\n"
             "🖤 Telegram:@vamp1r3s أسود واضح 88%\n"
             "🖋 40 نص Tel:@vamp1r3s + 6 مراسي مدمرة\n"
             "🛡️ مضاد لمنهجية dewatermark الكاملة\n"
             "👁 مقطع صافي ومريح للعين\n\n"
-            f"📐 عرض {w.width}x{w.height} | مخزن {w.coded_w}x{w.coded_h}\n"
+            f"📐 {w.width}x{w.height}\n"
             f"🎞 CRF {ENCODE_CRF} | maxrate {w.maxrate}\n"
             f"⏱ المعالجة: {fmt_time(elapsed)}"))
         await msg.edit_text(f"✅ انتهى!\n⏱ {fmt_time(elapsed)}\n💾 {sz:.1f}MB\n📚 بالانتظار: {JOB_QUEUE.qsize()}")
@@ -1236,7 +1211,7 @@ async def worker():
 @app.on_message(filters.command("start"))
 async def start(c, m):
     await m.reply("👋 هلا! 🎬\n\nأرسل فيديو وأضيف الحقوق:\n\n"
-                  "📐 نسخ هندسة الحاوية الأصلية (أبعاد+SAR+تدوير)\n"
+                  "📐 نفس أبعاد عرض مقطعك (9:16 يطلع 9:16)\n"
                   "🖤 Telegram:@vamp1r3s أسود واضح أغمق من الكل\n"
                   "🖋 40 نص Tel:@vamp1r3s + مراسي مدمرة للإزالة\n"
                   "👁 مقطع صافي ومريح للعين\n"
@@ -1266,7 +1241,7 @@ async def status(c, m):
 async def main():
     print("🤖 تشغيل البوت...")
     await app.start()
-    print("✓ البوت شغال | ترميز سريع + هندسة منسوخة")
+    print("✓ البوت شغال | تدوير قياسي فقط + ترميز سريع")
     asyncio.create_task(worker())
     try:
         from pyrogram import idle
