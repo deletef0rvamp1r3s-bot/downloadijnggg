@@ -30,7 +30,7 @@ API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
 if not API_ID or not API_HASH or not BOT_TOKEN:
-    raise ValueError("⚠️ عبي المتغيرات في Railway: API_ID, API_HASH, BOT_TOKEN")
+    raise ValueError("⚠️ عبّئ المتغيرات في Railway: API_ID, API_HASH, BOT_TOKEN")
 
 ENCODE_CRF = 18
 ENCODE_PRESET = "veryfast"
@@ -98,6 +98,9 @@ def extract_info(probe_res):
             sar_val = float(n) / float(d) if float(d) else 1.0
         except Exception:
             sar_val = 1.0
+    # ✅✅✅ التدوير فقط من مصفوفة العرض القياسية (side_data) — نفس المصدر اللي
+    # يحترمه جوالك وffmpeg وجميع المشغلات. شلنا قراءة الـ tags الكاذبة نهائياً
+    # (هي كانت سبب السترتش: كودي يصدقها والجوال وffmpeg يتجاهلونها)
     rotation = 0
     for sd in vs.get("side_data_list", []):
         if "rotation" in sd:
@@ -106,13 +109,6 @@ def extract_info(probe_res):
             except Exception:
                 pass
             break
-    if not rotation:
-        for k, v in (vs.get("tags", {}) or {}).items():
-            if "rotate" in k.lower():
-                try:
-                    rotation = int(float(v))
-                except Exception:
-                    pass
     # أبعاد العرض الصحيحة (نفس اللي يشوفها مشغل الجوال)
     if rotation in (90, -90, 270, -270):
         disp_w = int(round(src_h * sar_val)); disp_h = src_w
@@ -197,13 +193,14 @@ class FloatingWatermark:
         self.output_path = output_path
         self.audio_src = audio_src
         info = extract_info(probe_video(video_path))
-        # ✅✅✅ الأبعاد النهائية = أبعاد العرض الأصلية لمقطعك (نفس المشغل) — بدون أي تعديل منا
+        # ✅ الأبعاد النهائية = أبعاد العرض القياسية (نفس مصدر جوالك وffmpeg)
         self.width = info["true_w"]
         self.height = info["true_h"]
         self.fps = info["fps"] if info["fps"] > 0 else 30.0
         self.src_bitrate = info["bitrate"]
 
-        # ✅✅✅ ffmpeg يفك ويطبق التدوير والـ SAR صح (نفس محرك المشغلات) → فريمات خام بأبعاد العرض بالضبط
+        # ✅ ffmpeg يفك ويطبق تدوير مصفوفة العرض تلقائياً (autorotate) →
+        # الفريمات الخام تطلع بنفس اتجاه وأبعاد اللي يشوفها مشغل جوالك بالضبط
         self.raw_path = output_path + ".raw"
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", video_path,
                "-vf", f"scale={self.width}:{self.height}:flags=bilinear,format=bgr24",
@@ -980,7 +977,7 @@ class FloatingWatermark:
         return frame
 
     def process_frame(self, frame, frame_num):
-        # ✅ الفريم خام بأبعاد العرض الأصلية — ما نلمس الأبعاد أبداً
+        # ✅ الفريم خام بأبعاد العرض القياسية — ما نلمس الأبعاد أبداً
         out = frame
         blur_s = cv2.GaussianBlur(out, (0, 0), 1.1)
         out = np.clip(out.astype(np.float32) * 1.32 - blur_s.astype(np.float32) * 0.32,
@@ -1167,7 +1164,7 @@ async def process_job(job):
         job["stage"] = "upload"
         await message.reply_video(out, caption=(
             "✓ تمت إضافة الحقوق 🎬\n\n"
-            "📐 نفس أبعاد مقطعك الأصلي بالضبط (ffmpeg معتمد)\n"
+            "📐 نفس أبعاد مقطعك الأصلي بالضبط\n"
             "🖤 Telegram:@vamp1r3s أسود واضح 88%\n"
             "🖋 40 نص Tel:@vamp1r3s + 6 مراسي مدمرة\n"
             "🛡️ مضاد لمنهجية dewatermark الكاملة\n"
@@ -1244,7 +1241,7 @@ async def status(c, m):
 async def main():
     print("🤖 تشغيل البوت...")
     await app.start()
-    print("✓ البوت شغال | هيكل جديد: ffmpeg يفك بأبعاد العرض الأصلية = صفر سترتش")
+    print("✓ البوت شغال | التدوير من مصفوفة العرض فقط = صفر سترتش")
     asyncio.create_task(worker())
     try:
         from pyrogram import idle
