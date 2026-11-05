@@ -77,13 +77,8 @@ def probe_video(path):
     return None
 
 
-def extract_info(probe_res, cap):
-    cv_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
-    cv_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
-    cv_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    cv_n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-    out = {"src_w": cv_w, "src_h": cv_h, "true_w": cv_w, "true_h": cv_h,
-           "rotation": 0, "sar_val": 1.0, "fps": cv_fps, "total": cv_n, "bitrate": 0}
+def extract_info(probe_res):
+    out = {"true_w": 1280, "true_h": 720, "fps": 30.0, "total": 0, "bitrate": 0}
     if probe_res is None:
         return out
     vs = None
@@ -93,8 +88,8 @@ def extract_info(probe_res, cap):
             break
     if vs is None:
         return out
-    src_w = int(vs.get("width", cv_w))
-    src_h = int(vs.get("height", cv_h))
+    src_w = int(vs.get("width", 1280))
+    src_h = int(vs.get("height", 720))
     sar_val = 1.0
     sar_str = vs.get("sample_aspect_ratio", "1:1") or "1:1"
     if ":" in sar_str:
@@ -118,40 +113,39 @@ def extract_info(probe_res, cap):
                     rotation = int(float(v))
                 except Exception:
                     pass
+    # أبعاد العرض الصحيحة (نفس اللي يشوفها مشغل الجوال)
     if rotation in (90, -90, 270, -270):
         disp_w = int(round(src_h * sar_val)); disp_h = src_w
     else:
         disp_w = int(round(src_w * sar_val)); disp_h = src_h
     disp_w += disp_w % 2
     disp_h += disp_h % 2
-    fps = cv_fps
+    fps = 30.0
     rf = vs.get("r_frame_rate", "")
     if "/" in str(rf):
         try:
             n, d = rf.split("/")
-            fps = float(n) / float(d) if float(d) else cv_fps
+            fps = float(n) / float(d) if float(d) else 30.0
         except Exception:
             pass
-    total = cv_n
+    total = 0
     nb = vs.get("nb_frames")
     try:
-        total = int(nb) if nb and nb != "N/A" else cv_n
+        total = int(nb) if nb and nb != "N/A" else 0
     except Exception:
-        pass
+        total = 0
     if total <= 0:
         try:
             dur = float(probe_res.get("format", {}).get("duration", 0))
-            total = int(dur * fps) if dur > 0 else 1
+            total = int(dur * fps) if dur > 0 else 0
         except Exception:
-            total = 1
+            total = 0
     br = 0
     try:
         br = int(probe_res.get("format", {}).get("bit_rate", 0) or 0)
     except Exception:
         pass
-    out.update({"src_w": src_w, "src_h": src_h, "true_w": disp_w, "true_h": disp_h,
-                "rotation": rotation, "sar_val": sar_val, "fps": fps,
-                "total": total, "bitrate": br})
+    out.update({"true_w": disp_w, "true_h": disp_h, "fps": fps, "total": total, "bitrate": br})
     return out
 
 
@@ -201,33 +195,35 @@ class FloatingWatermark:
     def __init__(self, video_path, output_path, audio_src=None):
         self.video_path = video_path
         self.output_path = output_path
-        self.cap = cv2.VideoCapture(video_path)
-        if not self.cap.isOpened():
-            raise ValueError("❌ ما قدرت أفتح الفيديو")
-        info = extract_info(probe_video(video_path), self.cap)
-        self.src_w, self.src_h = info["src_w"], info["src_h"]
+        self.audio_src = audio_src
+        info = extract_info(probe_video(video_path))
+        # ✅✅✅ الأبعاد النهائية = أبعاد العرض الأصلية لمقطعك (نفس المشغل) — بدون أي تعديل منا
+        self.width = info["true_w"]
+        self.height = info["true_h"]
         self.fps = info["fps"] if info["fps"] > 0 else 30.0
-        self.total_frames = info["total"]
         self.src_bitrate = info["bitrate"]
 
-        # ✅✅✅ الاتجاه والأبعاد من محتوى أول فريم نفسه — بدون SAR وبدون تخمين
-        ok, first = self.cap.read()
-        if not ok:
-            raise ValueError("❌ ما قدرت أقرأ أول فريم")
-        disp_aspect = info["true_w"] / max(1, info["true_h"])
-        self.frame_rot = self._pick_orientation(first, disp_aspect, info["rotation"])
-        first = self._rot90(first, self.frame_rot)
-        fh, fw = first.shape[:2]
-        self.width = fw + fw % 2
-        self.height = fh + fh % 2
-        self.rotation = self.frame_rot
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        # ✅✅✅ نهاية الإصلاح: الترميز = أبعاد المحتوى بالضبط = سترتش مستحيل
+        # ✅✅✅ ffmpeg يفك ويطبق التدوير والـ SAR صح (نفس محرك المشغلات) → فريمات خام بأبعاد العرض بالضبط
+        self.raw_path = output_path + ".raw"
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", video_path,
+               "-vf", f"scale={self.width}:{self.height}:flags=bilinear,format=bgr24",
+               "-f", "rawvideo", "-y", self.raw_path]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=TIME_HARD_SEC)
+        if r.returncode != 0 or not os.path.exists(self.raw_path):
+            raise ValueError(f"❌ فشل فك الفيديو: {r.stderr[-300:]}")
+        self.frame_bytes = self.width * self.height * 3
+        sz = os.path.getsize(self.raw_path)
+        self.total_frames = sz // self.frame_bytes
+        if self.total_frames <= 0:
+            raise ValueError("❌ ملف الفيديو الخام فاضي")
+        if info["total"] > 0:
+            self.total_frames = min(self.total_frames, info["total"] + 2)
+        self.raw_f = open(self.raw_path, "rb")
+        print(f"✅ أبعاد العرض النهائية: {self.width}x{self.height} | فريمات: {self.total_frames} @ {self.fps:.2f} (مطابقة للأصل)")
 
         br_m = self.src_bitrate / 1_000_000 if self.src_bitrate else 0
         cap_m = max(6.0, min(12.0, br_m * 2.2)) if br_m > 0 else 8.0
         self.maxrate = f"{cap_m:.0f}M"
-        print(f"🎞 src={self.src_w}x{self.src_h} rot_pick={self.frame_rot} → {self.width}x{self.height} @ {self.fps:.2f} maxrate={self.maxrate}")
         self.enc = PipeEncoder(self.width, self.height, self.fps, output_path,
                                audio_src, "1:1", ENCODE_CRF, ENCODE_PRESET, self.maxrate)
         self.text_variants = ["Tel:@vamp1r3s"]
@@ -282,33 +278,21 @@ class FloatingWatermark:
         self.ghosts = []
         self._init_ghosts()
 
-    # ✅ اختيار الاتجاه: مطابقة نسبة المحتوى لنسبة العرض المقصودة + أفضلية لبيانات الملف
-    def _pick_orientation(self, frame, disp_aspect, meta_rot):
-        cands = [0, 90, 180, 270]
-        aspects = []
-        for r in cands:
-            f = self._rot90(frame, r)
-            aspects.append(f.shape[1] / max(1, f.shape[0]))
-        match = [r for r, a in zip(cands, aspects)
-                 if abs(a - disp_aspect) / max(1e-6, disp_aspect) < 0.05]
-        meta_norm = int(meta_rot) % 360
-        meta_idx = meta_norm if meta_norm in (0, 90, 180, 270) else 0
-        if match:
-            return meta_idx if meta_idx in match else match[0]
-        return min(zip(cands, aspects), key=lambda t: abs(t[1] - disp_aspect))[0]
-
-    def _rot90(self, frame, r):
-        if r == 90:
-            return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-        if r == 180:
-            return cv2.rotate(frame, cv2.ROTATE_180)
-        if r == 270:
-            return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-        return frame
-
     @property
     def strong_text(self):
         return self.text_variants[0]
+
+    def close(self):
+        try:
+            if self.raw_f:
+                self.raw_f.close()
+        except Exception:
+            pass
+        try:
+            if os.path.exists(self.raw_path):
+                os.remove(self.raw_path)
+        except Exception:
+            pass
 
     def _get_font_path(self):
         for p in [os.path.join(TEMP_DIR, "Poppins-Medium.ttf"),
@@ -995,21 +979,8 @@ class FloatingWatermark:
                 frame[y0:y1, x0:x1].astype(np.float32) + add[:, :, None], 0, 255).astype(np.uint8)
         return frame
 
-    # ✅ تدوير ثابت محسوب من أول فريم + شبكة أمان لكل فريم
-    def _apply_rotation(self, frame):
-        frame = self._rot90(frame, self.frame_rot)
-        ta = self.width / max(1, self.height)
-        ca = frame.shape[1] / max(1, frame.shape[0])
-        if abs(ca - ta) / max(1e-6, ta) > 0.02:
-            best = min([0, 90, 180, 270],
-                       key=lambda r: abs((self._rot90(frame, r).shape[1] / max(1, self._rot90(frame, r).shape[0])) - ta))
-            frame = self._rot90(frame, best)
-        return frame
-
-    def process_frame(self, raw_frame, frame_num):
-        frame = self._apply_rotation(raw_frame)
-        if frame.shape[1] != self.width or frame.shape[0] != self.height:
-            frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
+    def process_frame(self, frame, frame_num):
+        # ✅ الفريم خام بأبعاد العرض الأصلية — ما نلمس الأبعاد أبداً
         out = frame
         blur_s = cv2.GaussianBlur(out, (0, 0), 1.1)
         out = np.clip(out.astype(np.float32) * 1.32 - blur_s.astype(np.float32) * 0.32,
@@ -1092,17 +1063,18 @@ class FloatingWatermark:
         n = 0
         t0 = time.time()
         while True:
-            ret, raw = self.cap.read()
-            if not ret:
+            buf = self.raw_f.read(self.frame_bytes)
+            if len(buf) < self.frame_bytes:
                 break
+            frame = np.frombuffer(buf, dtype=np.uint8).reshape(self.height, self.width, 3)
             n += 1
-            self.enc.write(self.process_frame(raw, n))
+            self.enc.write(self.process_frame(frame, n))
             if progress_cb is not None and n % 20 == 0:
                 progress_cb(n, self.total_frames)
         if progress_cb is not None:
             progress_cb(self.total_frames, self.total_frames)
-        self.cap.release()
         self.enc.close()
+        self.close()
         return time.time() - t0
 
 
@@ -1160,6 +1132,7 @@ async def process_job(job):
     message, msg, uid = job["message"], job["status_msg"], job["uid"]
     inp = os.path.join(TEMP_DIR, f"in_{uid}.mp4")
     out = os.path.join(TEMP_DIR, f"out_{uid}.mp4")
+    w = None
     try:
         job["stage"] = "download"
         await message.download(file_name=inp)
@@ -1194,12 +1167,12 @@ async def process_job(job):
         job["stage"] = "upload"
         await message.reply_video(out, caption=(
             "✓ تمت إضافة الحقوق 🎬\n\n"
-            "📐 أبعاد من محتوى الفيديو = صفر سترتش\n"
+            "📐 نفس أبعاد مقطعك الأصلي بالضبط (ffmpeg معتمد)\n"
             "🖤 Telegram:@vamp1r3s أسود واضح 88%\n"
             "🖋 40 نص Tel:@vamp1r3s + 6 مراسي مدمرة\n"
-            "🛡️ مضاد لمنهجية dewatermark (كشف/ترميم/زمن)\n"
+            "🛡️ مضاد لمنهجية dewatermark الكاملة\n"
             "👁 مقطع صافي ومريح للعين\n\n"
-            f"📐 {w.width}x{w.height} | rot {w.rotation}°\n"
+            f"📐 {w.width}x{w.height}\n"
             f"🎞 CRF {ENCODE_CRF} | maxrate {w.maxrate}\n"
             f"⏱ المعالجة: {fmt_time(elapsed)}"))
         await msg.edit_text(f"✅ انتهى!\n⏱ {fmt_time(elapsed)}\n💾 {sz:.1f}MB\n📚 بالانتظار: {JOB_QUEUE.qsize()}")
@@ -1210,6 +1183,11 @@ async def process_job(job):
         except Exception:
             pass
     finally:
+        if w is not None:
+            try:
+                w.close()
+            except Exception:
+                pass
         for p in (inp, out):
             try:
                 if os.path.exists(p):
@@ -1236,10 +1214,10 @@ async def worker():
 @app.on_message(filters.command("start"))
 async def start(c, m):
     await m.reply("👋 هلا! 🎬\n\nأرسل فيديو وأضيف الحقوق:\n\n"
-                  "📐 أبعاد من محتوى الفيديو = صفر سترتش\n"
+                  "📐 نفس أبعاد مقطعك الأصلي بالضبط (يستحيل سترتش)\n"
                   "🖤 Telegram:@vamp1r3s أسود واضح أغمق من الكل\n"
                   "🖋 40 نص Tel:@vamp1r3s + مراسي مدمرة للإزالة\n"
-                  " مقطع صافي ومريح للعين\n"
+                  "👁 مقطع صافي ومريح للعين\n"
                   "🚀 سريع | 💾 حجم معقول")
 
 
@@ -1266,7 +1244,7 @@ async def status(c, m):
 async def main():
     print("🤖 تشغيل البوت...")
     await app.start()
-    print("✓ البوت شغال | هيكل جديد: أبعاد من المحتوى + مضاد منهجية dewatermark")
+    print("✓ البوت شغال | هيكل جديد: ffmpeg يفك بأبعاد العرض الأصلية = صفر سترتش")
     asyncio.create_task(worker())
     try:
         from pyrogram import idle
