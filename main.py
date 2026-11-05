@@ -78,7 +78,7 @@ def probe_video(path):
 
 
 def extract_info(probe_res):
-    out = {"true_w": 1280, "true_h": 720, "fps": 30.0, "total": 0, "bitrate": 0}
+    out = {"fps": 30.0, "total": 0, "bitrate": 0}
     if probe_res is None:
         return out
     vs = None
@@ -88,34 +88,6 @@ def extract_info(probe_res):
             break
     if vs is None:
         return out
-    src_w = int(vs.get("width", 1280))
-    src_h = int(vs.get("height", 720))
-    sar_val = 1.0
-    sar_str = vs.get("sample_aspect_ratio", "1:1") or "1:1"
-    if ":" in sar_str:
-        try:
-            n, d = sar_str.split(":")
-            sar_val = float(n) / float(d) if float(d) else 1.0
-        except Exception:
-            sar_val = 1.0
-    # ✅✅✅ التدوير فقط من مصفوفة العرض القياسية (side_data) — نفس المصدر اللي
-    # يحترمه جوالك وffmpeg وجميع المشغلات. شلنا قراءة الـ tags الكاذبة نهائياً
-    # (هي كانت سبب السترتش: كودي يصدقها والجوال وffmpeg يتجاهلونها)
-    rotation = 0
-    for sd in vs.get("side_data_list", []):
-        if "rotation" in sd:
-            try:
-                rotation = int(float(sd["rotation"]))
-            except Exception:
-                pass
-            break
-    # أبعاد العرض الصحيحة (نفس اللي يشوفها مشغل الجوال)
-    if rotation in (90, -90, 270, -270):
-        disp_w = int(round(src_h * sar_val)); disp_h = src_w
-    else:
-        disp_w = int(round(src_w * sar_val)); disp_h = src_h
-    disp_w += disp_w % 2
-    disp_h += disp_h % 2
     fps = 30.0
     rf = vs.get("r_frame_rate", "")
     if "/" in str(rf):
@@ -141,8 +113,13 @@ def extract_info(probe_res):
         br = int(probe_res.get("format", {}).get("bit_rate", 0) or 0)
     except Exception:
         pass
-    out.update({"true_w": disp_w, "true_h": disp_h, "fps": fps, "total": total, "bitrate": br})
+    out.update({"fps": fps, "total": total, "bitrate": br})
     return out
+
+
+# ✅✅✅ بدون SAR، بدون scale، بدون وسوم: فك قياسي (تدوير مصفوفة العرض فقط)
+# نفس سلوك تيليجرام وجوالك بالضبط — الأبعاد تجي من الفريم الحقيقي بعدها
+DISPLAY_VF = "format=bgr24"
 
 
 class PipeEncoder:
@@ -193,14 +170,26 @@ class FloatingWatermark:
         self.output_path = output_path
         self.audio_src = audio_src
         info = extract_info(probe_video(video_path))
-        # ✅ الأبعاد النهائية = أبعاد العرض القياسية (نفس مصدر جوالك وffmpeg)
-        self.width = info["true_w"]
-        self.height = info["true_h"]
         self.fps = info["fps"] if info["fps"] > 0 else 30.0
         self.src_bitrate = info["bitrate"]
 
-        # ✅ ffmpeg يفك ويطبق تدوير مصفوفة العرض تلقائياً (autorotate) →
-        # الفريمات الخام تطلع بنفس اتجاه وأبعاد اللي يشوفها مشغل جوالك بالضبط
+        # ✅ نقيس الأبعاد من فريم حقيقي مفكوك بالفك القياسي (بدون SAR) = نفس عرض تيليجرام
+        png_path = output_path + ".probe.png"
+        cmd0 = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", video_path,
+                "-vf", DISPLAY_VF, "-frames:v", "1", "-y", png_path]
+        r0 = subprocess.run(cmd0, capture_output=True, text=True, timeout=120)
+        if r0.returncode != 0 or not os.path.exists(png_path):
+            raise ValueError(f"❌ فشل قراءة فريم المعاينة: {r0.stderr[-300:]}")
+        probe_img = cv2.imread(png_path)
+        try:
+            os.remove(png_path)
+        except Exception:
+            pass
+        if probe_img is None:
+            raise ValueError("❌ فشل قياس أبعاد الفريم")
+        self.height, self.width = probe_img.shape[:2]
+
+        # ✅ فك كامل بنفس الإعدادات نفسها → كل الفريمات بنفس الأبعاد بالضبط
         self.raw_path = output_path + ".raw"
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", video_path,
                "-vf", f"scale={self.width}:{self.height}:flags=bilinear,format=bgr24",
@@ -216,7 +205,7 @@ class FloatingWatermark:
         if info["total"] > 0:
             self.total_frames = min(self.total_frames, info["total"] + 2)
         self.raw_f = open(self.raw_path, "rb")
-        print(f"✅ أبعاد العرض النهائية: {self.width}x{self.height} | فريمات: {self.total_frames} @ {self.fps:.2f} (مطابقة للأصل)")
+        print(f"✅ الأبعاد الحقيقية (مثل عرض تيليجرام): {self.width}x{self.height} | فريمات: {self.total_frames} @ {self.fps:.2f}")
 
         br_m = self.src_bitrate / 1_000_000 if self.src_bitrate else 0
         cap_m = max(6.0, min(12.0, br_m * 2.2)) if br_m > 0 else 8.0
@@ -977,7 +966,6 @@ class FloatingWatermark:
         return frame
 
     def process_frame(self, frame, frame_num):
-        # ✅ الفريم خام بأبعاد العرض القياسية — ما نلمس الأبعاد أبداً
         out = frame
         blur_s = cv2.GaussianBlur(out, (0, 0), 1.1)
         out = np.clip(out.astype(np.float32) * 1.32 - blur_s.astype(np.float32) * 0.32,
@@ -1164,7 +1152,7 @@ async def process_job(job):
         job["stage"] = "upload"
         await message.reply_video(out, caption=(
             "✓ تمت إضافة الحقوق 🎬\n\n"
-            "📐 نفس أبعاد مقطعك الأصلي بالضبط\n"
+            "📐 نفس أبعاد مقطعك كما يعرضه تيليجرام (تجاهل SAR الكاذب)\n"
             "🖤 Telegram:@vamp1r3s أسود واضح 88%\n"
             "🖋 40 نص Tel:@vamp1r3s + 6 مراسي مدمرة\n"
             "🛡️ مضاد لمنهجية dewatermark الكاملة\n"
@@ -1211,7 +1199,7 @@ async def worker():
 @app.on_message(filters.command("start"))
 async def start(c, m):
     await m.reply("👋 هلا! 🎬\n\nأرسل فيديو وأضيف الحقوق:\n\n"
-                  "📐 نفس أبعاد مقطعك الأصلي بالضبط (يستحيل سترتش)\n"
+                  "📐 نفس أبعاد مقطعك كما يعرضه تيليجرام بالضبط\n"
                   "🖤 Telegram:@vamp1r3s أسود واضح أغمق من الكل\n"
                   "🖋 40 نص Tel:@vamp1r3s + مراسي مدمرة للإزالة\n"
                   "👁 مقطع صافي ومريح للعين\n"
@@ -1241,7 +1229,7 @@ async def status(c, m):
 async def main():
     print("🤖 تشغيل البوت...")
     await app.start()
-    print("✓ البوت شغال | التدوير من مصفوفة العرض فقط = صفر سترتش")
+    print("✓ البوت شغال | تجاهل SAR الكاذب = أبعاد مطابقة لتيليجرام")
     asyncio.create_task(worker())
     try:
         from pyrogram import idle
