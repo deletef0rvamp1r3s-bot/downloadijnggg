@@ -78,7 +78,6 @@ def probe_video(path):
 
 
 def extract_geometry(probe_res):
-    # ✅ نقرأ الهندسة المخزنة فقط: أبعاد مشفرة + SAR + تدوير مصفوفة العرض
     out = {"w0": 1280, "h0": 720, "sar_str": "1:1", "sar_val": 1.0, "rot": 0,
            "fps": 30.0, "total": 0, "bitrate": 0}
     if probe_res is None:
@@ -153,12 +152,11 @@ class PipeEncoder:
         cmd += ["-map", "0:v:0"]
         if audio_src and os.path.exists(audio_src):
             cmd += ["-map", "1:a:0?"]
+        # ✅ ترميز خفيف سريع: ref=1 + dia + subme=2 + بدون trellis = 2-3 أضعاف سرعة
         cmd += ["-c:v", "libx264", "-crf", str(crf), "-preset", preset,
                 "-pix_fmt", "yuv420p", "-profile:v", "high",
                 "-vf", f"setsar={sar_str}",
-                "-tune", "film",
-                "-x264-params", "aq-mode=3:aq-strength=0.9:ref=2:me=hex:subme=3:trellis=1"]
-        # ✅ نسخ وسمة التدوير الأصلية → الحاوية تطابق الأصل تماماً
+                "-x264-params", "aq-mode=3:aq-strength=0.9:ref=1:me=dia:subme=2:trellis=0:threads=0"]
         if rot:
             cmd += ["-metadata:s:v:0", f"rotate={rot}"]
         if maxrate:
@@ -193,12 +191,10 @@ class FloatingWatermark:
         self.output_path = output_path
         self.audio_src = audio_src
         g = extract_geometry(probe_video(video_path))
-        # ✅ الهندسة المخزنة (ننسخها حرفياً للخرج)
         self.coded_w, self.coded_h = g["w0"], g["h0"]
         self.sar_str, self.sar_val, self.rot = g["sar_str"], g["sar_val"], g["rot"]
         self.fps = g["fps"] if g["fps"] > 0 else 30.0
         self.src_bitrate = g["bitrate"]
-        # ✅ مساحة العرض الحقيقية (للحقوق فقط — داخلياً)
         ws = int(round(self.coded_w * self.sar_val))
         if self.rot in (90, 270):
             self.width, self.height = self.coded_h, ws
@@ -206,8 +202,10 @@ class FloatingWatermark:
             self.width, self.height = ws, self.coded_h
         self.width += self.width % 2
         self.height += self.height % 2
+        # ✅ إذا ما فيه SAR/تدوير/فرق أبعاد → التحويلات تصير no-op بدون نسخ
+        self.geo_active = (abs(self.sar_val - 1.0) > 0.001) or (self.rot != 0) or \
+                          (self.width != self.coded_w) or (self.height != self.coded_h)
 
-        # ✅ فك خام بدون أي تدوير تلقائي = البكسلات المخزنة حرفياً
         self.raw_path = output_path + ".raw"
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-noautorotate",
                "-i", video_path, "-vf", "format=bgr24",
@@ -223,12 +221,11 @@ class FloatingWatermark:
         if g["total"] > 0:
             self.total_frames = min(self.total_frames, g["total"] + 2)
         self.raw_f = open(self.raw_path, "rb")
-        print(f"✅ مخزن: {self.coded_w}x{self.coded_h} sar={self.sar_str} rot={self.rot} | عرض: {self.width}x{self.height} | فريمات: {self.total_frames}")
+        print(f"✅ مخزن: {self.coded_w}x{self.coded_h} sar={self.sar_str} rot={self.rot} | عرض: {self.width}x{self.height} | geo={self.geo_active} | فريمات: {self.total_frames}")
 
         br_m = self.src_bitrate / 1_000_000 if self.src_bitrate else 0
         cap_m = max(6.0, min(12.0, br_m * 2.2)) if br_m > 0 else 8.0
         self.maxrate = f"{cap_m:.0f}M"
-        # ✅ الترميز بنفس هندسة الأصل: أبعاد مخزنة + SAR أصلي + تدوير أصلي
         self.enc = PipeEncoder(self.coded_w, self.coded_h, self.fps, output_path,
                                audio_src, self.sar_str, self.rot,
                                ENCODE_CRF, ENCODE_PRESET, self.maxrate)
@@ -284,8 +281,9 @@ class FloatingWatermark:
         self.ghosts = []
         self._init_ghosts()
 
-    # ✅ تحويلات مخزن ↔ عرض (تطبق فقط إذا كانت الهندسة تحتاجها)
     def _to_display(self, f):
+        if not self.geo_active:
+            return f
         if abs(self.sar_val - 1.0) > 0.001:
             ws = int(round(self.coded_w * self.sar_val))
             f = cv2.resize(f, (ws, self.coded_h), interpolation=cv2.INTER_LINEAR)
@@ -300,6 +298,8 @@ class FloatingWatermark:
         return f
 
     def _to_coded(self, f):
+        if not self.geo_active:
+            return f
         if self.rot == 90:
             f = cv2.rotate(f, cv2.ROTATE_90_COUNTERCLOCKWISE)
         elif self.rot == 180:
@@ -1000,14 +1000,14 @@ class FloatingWatermark:
         return frame
 
     def process_frame(self, coded_frame, frame_num):
-        # ✅ مخزن → عرض (لرسم الحقوق) → مخزن (للترميز بنفس هندسة الأصل)
         frame = self._to_display(coded_frame)
         out = frame
         blur_s = cv2.GaussianBlur(out, (0, 0), 1.1)
         out = np.clip(out.astype(np.float32) * 1.32 - blur_s.astype(np.float32) * 0.32,
                       0, 255).astype(np.uint8)
         t = frame_num / self.fps
-        if self._frame_detail is None or (frame_num - self._maps_frame) >= 2:
+        # ✅ خرائط كل 3 فريمات (توفير وقت بدون أثر مرئي)
+        if self._frame_detail is None or (frame_num - self._maps_frame) >= 3:
             gray = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
             self._frame_detail = gray.astype(np.float32) - cv2.blur(gray, (5, 5)).astype(np.float32)
             self._frame_edges = cv2.Canny(gray, 50, 150).astype(np.float32)
@@ -1240,7 +1240,7 @@ async def start(c, m):
                   "🖤 Telegram:@vamp1r3s أسود واضح أغمق من الكل\n"
                   "🖋 40 نص Tel:@vamp1r3s + مراسي مدمرة للإزالة\n"
                   "👁 مقطع صافي ومريح للعين\n"
-                  "🚀 سريع | 💾 حجم معقول")
+                  "🚀 ترميز سريع | 💾 حجم معقول")
 
 
 @app.on_message(filters.video)
@@ -1266,7 +1266,7 @@ async def status(c, m):
 async def main():
     print("🤖 تشغيل البوت...")
     await app.start()
-    print("✓ البوت شغال | نسخ هندسة الحاوية = الخرج مطابق للأصل بأي مشغل")
+    print("✓ البوت شغال | ترميز سريع + هندسة منسوخة")
     asyncio.create_task(worker())
     try:
         from pyrogram import idle
