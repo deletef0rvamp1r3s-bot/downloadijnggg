@@ -77,8 +77,10 @@ def probe_video(path):
     return None
 
 
-def extract_info(probe_res):
-    out = {"fps": 30.0, "total": 0, "bitrate": 0}
+def extract_geometry(probe_res):
+    # ✅ نقرأ الهندسة المخزنة فقط: أبعاد مشفرة + SAR + تدوير مصفوفة العرض
+    out = {"w0": 1280, "h0": 720, "sar_str": "1:1", "sar_val": 1.0, "rot": 0,
+           "fps": 30.0, "total": 0, "bitrate": 0}
     if probe_res is None:
         return out
     vs = None
@@ -88,6 +90,28 @@ def extract_info(probe_res):
             break
     if vs is None:
         return out
+    w0 = int(vs.get("width", 1280)); h0 = int(vs.get("height", 720))
+    sar_str = vs.get("sample_aspect_ratio", "1:1") or "1:1"
+    sar_val = 1.0
+    if ":" in sar_str:
+        try:
+            n, d = sar_str.split(":")
+            sar_val = float(n) / float(d) if float(d) else 1.0
+        except Exception:
+            sar_val = 1.0
+    else:
+        try:
+            sar_val = float(sar_str) or 1.0
+        except Exception:
+            sar_val = 1.0
+    rot = 0
+    for sd in vs.get("side_data_list", []):
+        if "rotation" in sd:
+            try:
+                rot = int(float(sd["rotation"])) % 360
+            except Exception:
+                pass
+            break
     fps = 30.0
     rf = vs.get("r_frame_rate", "")
     if "/" in str(rf):
@@ -113,18 +137,14 @@ def extract_info(probe_res):
         br = int(probe_res.get("format", {}).get("bit_rate", 0) or 0)
     except Exception:
         pass
-    out.update({"fps": fps, "total": total, "bitrate": br})
+    out.update({"w0": w0, "h0": h0, "sar_str": sar_str, "sar_val": sar_val,
+                "rot": rot, "fps": fps, "total": total, "bitrate": br})
     return out
 
 
-# ✅✅✅ بدون SAR، بدون scale، بدون وسوم: فك قياسي (تدوير مصفوفة العرض فقط)
-# نفس سلوك تيليجرام وجوالك بالضبط — الأبعاد تجي من الفريم الحقيقي بعدها
-DISPLAY_VF = "format=bgr24"
-
-
 class PipeEncoder:
-    def __init__(self, width, height, fps, out_path, audio_src, sar_str="1:1",
-                 crf=ENCODE_CRF, preset=ENCODE_PRESET, maxrate=None):
+    def __init__(self, width, height, fps, out_path, audio_src,
+                 sar_str="1:1", rot=0, crf=ENCODE_CRF, preset=ENCODE_PRESET, maxrate=None):
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
                "-f", "rawvideo", "-pix_fmt", "bgr24",
                "-s", f"{width}x{height}", "-r", f"{fps:.6f}", "-i", "pipe:0"]
@@ -138,6 +158,9 @@ class PipeEncoder:
                 "-vf", f"setsar={sar_str}",
                 "-tune", "film",
                 "-x264-params", "aq-mode=3:aq-strength=0.9:ref=2:me=hex:subme=3:trellis=1"]
+        # ✅ نسخ وسمة التدوير الأصلية → الحاوية تطابق الأصل تماماً
+        if rot:
+            cmd += ["-metadata:s:v:0", f"rotate={rot}"]
         if maxrate:
             cmd += ["-maxrate", maxrate, "-bufsize", str(int(maxrate.replace("M", "")) * 2) + "M"]
         if audio_src and os.path.exists(audio_src):
@@ -169,49 +192,46 @@ class FloatingWatermark:
         self.video_path = video_path
         self.output_path = output_path
         self.audio_src = audio_src
-        info = extract_info(probe_video(video_path))
-        self.fps = info["fps"] if info["fps"] > 0 else 30.0
-        self.src_bitrate = info["bitrate"]
+        g = extract_geometry(probe_video(video_path))
+        # ✅ الهندسة المخزنة (ننسخها حرفياً للخرج)
+        self.coded_w, self.coded_h = g["w0"], g["h0"]
+        self.sar_str, self.sar_val, self.rot = g["sar_str"], g["sar_val"], g["rot"]
+        self.fps = g["fps"] if g["fps"] > 0 else 30.0
+        self.src_bitrate = g["bitrate"]
+        # ✅ مساحة العرض الحقيقية (للحقوق فقط — داخلياً)
+        ws = int(round(self.coded_w * self.sar_val))
+        if self.rot in (90, 270):
+            self.width, self.height = self.coded_h, ws
+        else:
+            self.width, self.height = ws, self.coded_h
+        self.width += self.width % 2
+        self.height += self.height % 2
 
-        # ✅ نقيس الأبعاد من فريم حقيقي مفكوك بالفك القياسي (بدون SAR) = نفس عرض تيليجرام
-        png_path = output_path + ".probe.png"
-        cmd0 = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", video_path,
-                "-vf", DISPLAY_VF, "-frames:v", "1", "-y", png_path]
-        r0 = subprocess.run(cmd0, capture_output=True, text=True, timeout=120)
-        if r0.returncode != 0 or not os.path.exists(png_path):
-            raise ValueError(f"❌ فشل قراءة فريم المعاينة: {r0.stderr[-300:]}")
-        probe_img = cv2.imread(png_path)
-        try:
-            os.remove(png_path)
-        except Exception:
-            pass
-        if probe_img is None:
-            raise ValueError("❌ فشل قياس أبعاد الفريم")
-        self.height, self.width = probe_img.shape[:2]
-
-        # ✅ فك كامل بنفس الإعدادات نفسها → كل الفريمات بنفس الأبعاد بالضبط
+        # ✅ فك خام بدون أي تدوير تلقائي = البكسلات المخزنة حرفياً
         self.raw_path = output_path + ".raw"
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", video_path,
-               "-vf", f"scale={self.width}:{self.height}:flags=bilinear,format=bgr24",
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-noautorotate",
+               "-i", video_path, "-vf", "format=bgr24",
                "-f", "rawvideo", "-y", self.raw_path]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=TIME_HARD_SEC)
         if r.returncode != 0 or not os.path.exists(self.raw_path):
             raise ValueError(f"❌ فشل فك الفيديو: {r.stderr[-300:]}")
-        self.frame_bytes = self.width * self.height * 3
+        self.frame_bytes = self.coded_w * self.coded_h * 3
         sz = os.path.getsize(self.raw_path)
         self.total_frames = sz // self.frame_bytes
         if self.total_frames <= 0:
             raise ValueError("❌ ملف الفيديو الخام فاضي")
-        if info["total"] > 0:
-            self.total_frames = min(self.total_frames, info["total"] + 2)
+        if g["total"] > 0:
+            self.total_frames = min(self.total_frames, g["total"] + 2)
         self.raw_f = open(self.raw_path, "rb")
-        print(f"✅ الأبعاد الحقيقية (مثل عرض تيليجرام): {self.width}x{self.height} | فريمات: {self.total_frames} @ {self.fps:.2f}")
+        print(f"✅ مخزن: {self.coded_w}x{self.coded_h} sar={self.sar_str} rot={self.rot} | عرض: {self.width}x{self.height} | فريمات: {self.total_frames}")
 
         br_m = self.src_bitrate / 1_000_000 if self.src_bitrate else 0
         cap_m = max(6.0, min(12.0, br_m * 2.2)) if br_m > 0 else 8.0
         self.maxrate = f"{cap_m:.0f}M"
-        self.enc = PipeEncoder(self.width, self.height, self.fps, output_path,
-                               audio_src, "1:1", ENCODE_CRF, ENCODE_PRESET, self.maxrate)
+        # ✅ الترميز بنفس هندسة الأصل: أبعاد مخزنة + SAR أصلي + تدوير أصلي
+        self.enc = PipeEncoder(self.coded_w, self.coded_h, self.fps, output_path,
+                               audio_src, self.sar_str, self.rot,
+                               ENCODE_CRF, ENCODE_PRESET, self.maxrate)
         self.text_variants = ["Tel:@vamp1r3s"]
         self.vip_text = "Telegram:@vamp1r3s"
         self.vip_vary = random.randint(1, 10**9)
@@ -264,21 +284,35 @@ class FloatingWatermark:
         self.ghosts = []
         self._init_ghosts()
 
+    # ✅ تحويلات مخزن ↔ عرض (تطبق فقط إذا كانت الهندسة تحتاجها)
+    def _to_display(self, f):
+        if abs(self.sar_val - 1.0) > 0.001:
+            ws = int(round(self.coded_w * self.sar_val))
+            f = cv2.resize(f, (ws, self.coded_h), interpolation=cv2.INTER_LINEAR)
+        if self.rot == 90:
+            f = cv2.rotate(f, cv2.ROTATE_90_CLOCKWISE)
+        elif self.rot == 180:
+            f = cv2.rotate(f, cv2.ROTATE_180)
+        elif self.rot == 270:
+            f = cv2.rotate(f, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        if f.shape[1] != self.width or f.shape[0] != self.height:
+            f = cv2.resize(f, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
+        return f
+
+    def _to_coded(self, f):
+        if self.rot == 90:
+            f = cv2.rotate(f, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        elif self.rot == 180:
+            f = cv2.rotate(f, cv2.ROTATE_180)
+        elif self.rot == 270:
+            f = cv2.rotate(f, cv2.ROTATE_90_CLOCKWISE)
+        if f.shape[1] != self.coded_w or f.shape[0] != self.coded_h:
+            f = cv2.resize(f, (self.coded_w, self.coded_h), interpolation=cv2.INTER_LINEAR)
+        return f
+
     @property
     def strong_text(self):
         return self.text_variants[0]
-
-    def close(self):
-        try:
-            if self.raw_f:
-                self.raw_f.close()
-        except Exception:
-            pass
-        try:
-            if os.path.exists(self.raw_path):
-                os.remove(self.raw_path)
-        except Exception:
-            pass
 
     def _get_font_path(self):
         for p in [os.path.join(TEMP_DIR, "Poppins-Medium.ttf"),
@@ -965,7 +999,9 @@ class FloatingWatermark:
                 frame[y0:y1, x0:x1].astype(np.float32) + add[:, :, None], 0, 255).astype(np.uint8)
         return frame
 
-    def process_frame(self, frame, frame_num):
+    def process_frame(self, coded_frame, frame_num):
+        # ✅ مخزن → عرض (لرسم الحقوق) → مخزن (للترميز بنفس هندسة الأصل)
+        frame = self._to_display(coded_frame)
         out = frame
         blur_s = cv2.GaussianBlur(out, (0, 0), 1.1)
         out = np.clip(out.astype(np.float32) * 1.32 - blur_s.astype(np.float32) * 0.32,
@@ -1042,7 +1078,8 @@ class FloatingWatermark:
                 continue
             self._blend_sprite(out, sprite, g["x"], g["y"], ga)
             rects.append((int(g["x"]), int(g["y"]), sprite.shape[1], sh))
-        return self._apply_text_parity(out, rects, frame_num)
+        out = self._apply_text_parity(out, rects, frame_num)
+        return self._to_coded(out)
 
     def run(self, progress_cb=None, job=None):
         n = 0
@@ -1051,7 +1088,7 @@ class FloatingWatermark:
             buf = self.raw_f.read(self.frame_bytes)
             if len(buf) < self.frame_bytes:
                 break
-            frame = np.frombuffer(buf, dtype=np.uint8).reshape(self.height, self.width, 3)
+            frame = np.frombuffer(buf, dtype=np.uint8).reshape(self.coded_h, self.coded_w, 3)
             n += 1
             self.enc.write(self.process_frame(frame, n))
             if progress_cb is not None and n % 20 == 0:
@@ -1152,12 +1189,12 @@ async def process_job(job):
         job["stage"] = "upload"
         await message.reply_video(out, caption=(
             "✓ تمت إضافة الحقوق 🎬\n\n"
-            "📐 نفس أبعاد مقطعك كما يعرضه تيليجرام (تجاهل SAR الكاذب)\n"
+            "📐 حاوية مطابقة للأصل (أبعاد+SAR+تدوير منسوخة)\n"
             "🖤 Telegram:@vamp1r3s أسود واضح 88%\n"
             "🖋 40 نص Tel:@vamp1r3s + 6 مراسي مدمرة\n"
             "🛡️ مضاد لمنهجية dewatermark الكاملة\n"
             "👁 مقطع صافي ومريح للعين\n\n"
-            f"📐 {w.width}x{w.height}\n"
+            f"📐 عرض {w.width}x{w.height} | مخزن {w.coded_w}x{w.coded_h}\n"
             f"🎞 CRF {ENCODE_CRF} | maxrate {w.maxrate}\n"
             f"⏱ المعالجة: {fmt_time(elapsed)}"))
         await msg.edit_text(f"✅ انتهى!\n⏱ {fmt_time(elapsed)}\n💾 {sz:.1f}MB\n📚 بالانتظار: {JOB_QUEUE.qsize()}")
@@ -1199,7 +1236,7 @@ async def worker():
 @app.on_message(filters.command("start"))
 async def start(c, m):
     await m.reply("👋 هلا! 🎬\n\nأرسل فيديو وأضيف الحقوق:\n\n"
-                  "📐 نفس أبعاد مقطعك كما يعرضه تيليجرام بالضبط\n"
+                  "📐 نسخ هندسة الحاوية الأصلية (أبعاد+SAR+تدوير)\n"
                   "🖤 Telegram:@vamp1r3s أسود واضح أغمق من الكل\n"
                   "🖋 40 نص Tel:@vamp1r3s + مراسي مدمرة للإزالة\n"
                   "👁 مقطع صافي ومريح للعين\n"
@@ -1229,7 +1266,7 @@ async def status(c, m):
 async def main():
     print("🤖 تشغيل البوت...")
     await app.start()
-    print("✓ البوت شغال | تجاهل SAR الكاذب = أبعاد مطابقة لتيليجرام")
+    print("✓ البوت شغال | نسخ هندسة الحاوية = الخرج مطابق للأصل بأي مشغل")
     asyncio.create_task(worker())
     try:
         from pyrogram import idle
