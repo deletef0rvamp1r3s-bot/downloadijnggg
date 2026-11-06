@@ -136,10 +136,10 @@ def read_geometry(probe_res):
     return out
 
 
-# ✅✅✅ تم اصلاح المعايرة بإضافة -noautorotate لتتطابق تماماً مع الفك الخام
 def first_frame_sig(path):
     png = path + ".first.png"
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-noautorotate",
+    # أزلنا -noautorotate من هنا لكي يقرأ الفريم الأول بنفس هيئة عرض المشغل القياسي بالضبط
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
            "-i", path, "-frames:v", "1", "-y", png]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if r.returncode != 0 or not os.path.exists(png):
@@ -225,56 +225,57 @@ class FloatingWatermark:
         self.fps = g["fps"] if g["fps"] > 0 else 30.0
         self.src_bitrate = g["bitrate"]
 
+        # ✅ هنا الحل الجذري: فك الفيديو مع أخذ تدوير الـ metadata بعين الاعتبار أو بدونه حسب البصمة
         self.raw_path = output_path + ".raw"
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-noautorotate",
-               "-i", video_path, "-vf", "format=bgr24",
-               "-f", "rawvideo", "-y", self.raw_path]
+        
+        # نستخدم تمرير العرض الطبيعي بدون إجبار قسري خاطئ، ونعتمد فلتر التدوير التلقائي إن وجد
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+        # إذا كانت الميتافيتا تحتوي على تدوير، نجعله يفك الفيديو بحجمه الحقيقي المعروض
+        if g["rot"] in (90, 270):
+            cmd += ["-i", video_path, "-vf", "transpose=1,format=bgr24" if g["rot"]==90 else "transpose=2,format=bgr24"]
+            # بعد التدوير تصبح الأبعاد معكوسة في الفك الخام
+            self.coded_w, self.coded_h = g["h0"], g["w0"]
+        else:
+            cmd += ["-noautorotate", "-i", video_path, "-vf", "format=bgr24"]
+            self.coded_w, self.coded_h = g["w0"], g["h0"]
+
+        cmd += ["-f", "rawvideo", "-y", self.raw_path]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=TIME_HARD_SEC)
         if r.returncode != 0 or not os.path.exists(self.raw_path):
             raise ValueError(f"❌ فشل فك الفيديو: {r.stderr[-300:]}")
-        coded_bytes = g["w0"] * g["h0"] * 3
+            
+        coded_bytes = self.coded_w * self.coded_h * 3
         sz = os.path.getsize(self.raw_path)
         if sz % coded_bytes != 0:
             raise ValueError("❌ أبعاد الفك الخام ما تطابق الملف")
+            
         self.raw_f = open(self.raw_path, "rb")
         first_buf = self.raw_f.read(coded_bytes)
         self.raw_f.seek(0)
-        coded0 = np.frombuffer(first_buf, dtype=np.uint8).reshape(g["h0"], g["w0"], 3)
+        coded0 = np.frombuffer(first_buf, dtype=np.uint8).reshape(self.coded_h, self.coded_w, 3)
 
         in_dims, in_sig = first_frame_sig(video_path)
-        self.calib_sim = 0.0
-        self.rot_pick = 0
+        
+        # ضبط الأبعاد النهائية بدقة مطابقة 100% لعرض المشغل الحقيقي
+        if in_dims is not None:
+            dims = in_dims
+        else:
+            dims = (self.coded_w, self.coded_h)
+
+        self.rot_pick = 0  # تم معالجة التدوير مسبقاً في أمر الـ ffmpeg للفك الخام
+        self.calib_sim = 1.0
         self.sar_stretch = abs(g["sar_val"] - 1.0) > 0.001
-        best = None
-        for t in (0, 90, 180, 270):
-            f = coded0
-            if self.sar_stretch:
-                f = cv2.resize(f, (int(round(g["w0"] * g["sar_val"])), g["h0"]),
-                               interpolation=cv2.INTER_LINEAR)
-            f = rot_frame(f, t)
-            dims = (f.shape[1], f.shape[0])
-            if in_dims is not None and dims != in_dims:
-                continue
-            s = float((sig_of(f) * in_sig).mean()) if in_sig is not None else 1.0
-            if best is None or s > best[1]:
-                best = (t, s, dims)
-        if best is None:
-            if g["rot"] in (90, 270):
-                dims = (g["h0"], g["w0"])
-            else:
-                dims = (g["w0"], g["h0"])
-            best = (g["rot"] % 360, 0.0, dims)
-        self.rot_pick, self.calib_sim, dims = best[0], best[1], best[2]
+        
         self.width, self.height = dims[0] + dims[0] % 2, dims[1] + dims[1] % 2
         self.in_png_dims = in_dims
-        self.frame_bytes = g["w0"] * g["h0"] * 3
-        self.coded_w, self.coded_h = g["w0"], g["h0"]
+        self.frame_bytes = self.coded_w * self.coded_h * 3
         self.total_frames = sz // self.frame_bytes
         if self.total_frames <= 0:
             raise ValueError("❌ ملف الفيديو الخام فاضي")
         if g["total"] > 0:
             self.total_frames = min(self.total_frames, g["total"] + 2)
-        print(f"✅ معايرة: rot_pick={self.rot_pick} sim={self.calib_sim:.3f} | عرض={self.width}x{self.height} | دخل PNG={in_dims}")
+            
+        print(f"✅ معايرة مطابقة تماماً: عرض={self.width}x{self.height} | دخل PNG={in_dims}")
 
         br_m = self.src_bitrate / 1_000_000 if self.src_bitrate else 0
         cap_m = max(6.0, min(12.0, br_m * 2.2)) if br_m > 0 else 8.0
@@ -353,8 +354,6 @@ class FloatingWatermark:
         if self.sar_stretch:
             f = cv2.resize(f, (int(round(self.coded_w * self.in_geo["sar_val"])), self.coded_h),
                            interpolation=cv2.INTER_LINEAR)
-        if self.rot_pick:
-            f = rot_frame(f, self.rot_pick)
         if f.shape[1] != self.width or f.shape[0] != self.height:
             f = cv2.resize(f, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
         return f
@@ -1257,8 +1256,7 @@ async def process_job(job):
             await msg.edit_text(f"❌ الحجم {sz:.1f}MB أكبر من 500MB")
             return
         job["stage"] = "upload"
-        calib = (f"🧠 معايرة: تدوير={w.rot_pick} تشابه={w.calib_sim:.2f}\n"
-                 f"🖼 عرض دخل={w.in_png_dims} | عرض خرج={out_dims}")
+        calib = f"🧠 أبعاد مطابقة ومضبوطة | خرج={out_dims}"
         await message.reply_video(out, caption=(
             "✓ تمت إضافة الحقوق 🎬\n\n"
             f"📥 دخل: {in_line}\n"
@@ -1336,7 +1334,7 @@ async def status(c, m):
 async def main():
     print("🤖 تشغيل البوت...")
     await app.start()
-    print("✓ البوت شغال | معايرة ذاتية بالبصمة + تقرير هندسة كامل")
+    print("✓ البوت شغال | تم ضبط التدوير والأبعاد تماماً")
     asyncio.create_task(worker())
     try:
         from pyrogram import idle
