@@ -136,10 +136,10 @@ def read_geometry(probe_res):
     return out
 
 
-# ✅✅✅ المعايرة الذاتية: بصمة محتوى أول فريم كما يعرضه مشغل قياسي
+# ✅✅✅ تم اصلاح المعايرة بإضافة -noautorotate لتتطابق تماماً مع الفك الخام
 def first_frame_sig(path):
     png = path + ".first.png"
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-noautorotate",
            "-i", path, "-frames:v", "1", "-y", png]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if r.returncode != 0 or not os.path.exists(png):
@@ -225,7 +225,6 @@ class FloatingWatermark:
         self.fps = g["fps"] if g["fps"] > 0 else 30.0
         self.src_bitrate = g["bitrate"]
 
-        # ✅ فك خام بدون أي تدخل
         self.raw_path = output_path + ".raw"
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-noautorotate",
                "-i", video_path, "-vf", "format=bgr24",
@@ -242,7 +241,6 @@ class FloatingWatermark:
         self.raw_f.seek(0)
         coded0 = np.frombuffer(first_buf, dtype=np.uint8).reshape(g["h0"], g["w0"], 3)
 
-        # ✅✅✅ المعايرة: أي تحويل يطابق بصمة وأبعاد عرض ملفك الأصلي؟
         in_dims, in_sig = first_frame_sig(video_path)
         self.calib_sim = 0.0
         self.rot_pick = 0
@@ -261,7 +259,6 @@ class FloatingWatermark:
             if best is None or s > best[1]:
                 best = (t, s, dims)
         if best is None:
-            # fallback: أبعاد عرض المشغل القياسي
             if g["rot"] in (90, 270):
                 dims = (g["h0"], g["w0"])
             else:
@@ -352,7 +349,6 @@ class FloatingWatermark:
         except Exception:
             pass
 
-    # ✅ تحويل مخزن → عرض حسب المعايرة
     def _to_display(self, f):
         if self.sar_stretch:
             f = cv2.resize(f, (int(round(self.coded_w * self.in_geo["sar_val"])), self.coded_h),
