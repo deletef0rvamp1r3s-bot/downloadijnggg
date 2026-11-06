@@ -78,7 +78,7 @@ def probe_video(path):
 
 
 def read_geometry(probe_res):
-    out = {"w0": 720, "h0": 1280, "sar_str": "1:1", "rot": 0,
+    out = {"w0": 720, "h0": 1280, "sar_str": "1:1", "sar_val": 1.0, "rot": 0,
            "fps": 30.0, "total": 0, "bitrate": 0}
     if probe_res is None:
         return out
@@ -91,6 +91,13 @@ def read_geometry(probe_res):
         return out
     w0 = int(vs.get("width", 720)); h0 = int(vs.get("height", 1280))
     sar_str = vs.get("sample_aspect_ratio", "1:1") or "1:1"
+    sar_val = 1.0
+    if ":" in sar_str:
+        try:
+            n, d = sar_str.split(":")
+            sar_val = float(n) / float(d) if float(d) else 1.0
+        except Exception:
+            sar_val = 1.0
     rot = 0
     for sd in vs.get("side_data_list", []):
         if "rotation" in sd:
@@ -124,17 +131,47 @@ def read_geometry(probe_res):
         br = int(probe_res.get("format", {}).get("bit_rate", 0) or 0)
     except Exception:
         pass
-    out.update({"w0": w0, "h0": h0, "sar_str": sar_str, "rot": rot,
-                "fps": fps, "total": total, "bitrate": br})
+    out.update({"w0": w0, "h0": h0, "sar_str": sar_str, "sar_val": sar_val,
+                "rot": rot, "fps": fps, "total": total, "bitrate": br})
     return out
 
 
-def rot_vf(rot):
-    if rot in (90, 270):
-        return "transpose=1" if rot == 90 else "transpose=2"
-    if rot == 180:
-        return "transpose=1,transpose=1"
-    return None
+# ✅✅✅ المعايرة الذاتية: بصمة محتوى أول فريم كما يعرضه مشغل قياسي
+def first_frame_sig(path):
+    png = path + ".first.png"
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+           "-i", path, "-frames:v", "1", "-y", png]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if r.returncode != 0 or not os.path.exists(png):
+        return None, None
+    img = cv2.imread(png)
+    try:
+        os.remove(png)
+    except Exception:
+        pass
+    if img is None:
+        return None, None
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    g = cv2.resize(g, (64, 64)).astype(np.float32)
+    g = (g - g.mean()) / (g.std() + 1e-6)
+    return (img.shape[1], img.shape[0]), g
+
+
+def sig_of(frame):
+    g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    g = cv2.resize(g, (64, 64)).astype(np.float32)
+    g = (g - g.mean()) / (g.std() + 1e-6)
+    return g
+
+
+def rot_frame(f, t):
+    if t == 90:
+        return cv2.rotate(f, cv2.ROTATE_90_CLOCKWISE)
+    if t == 180:
+        return cv2.rotate(f, cv2.ROTATE_180)
+    if t == 270:
+        return cv2.rotate(f, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return f
 
 
 class PipeEncoder:
@@ -187,50 +224,60 @@ class FloatingWatermark:
         self.in_geo = g
         self.fps = g["fps"] if g["fps"] > 0 else 30.0
         self.src_bitrate = g["bitrate"]
-        # ✅ قاعدة تيليجرام: التدوير من مصفوفة العرض فقط، SAR متجاهل
-        if g["rot"] in (90, 270):
-            self.width, self.height = g["h0"], g["w0"]
-        else:
-            self.width, self.height = g["w0"], g["h0"]
-        self.width += self.width % 2
-        self.height += self.height % 2
 
-        # ✅ فك مع شفاء ذاتي: نتحقق رياضياً مما إذا كان السيرفر طبق التدوير من نفسه
+        # ✅ فك خام بدون أي تدخل
         self.raw_path = output_path + ".raw"
-        vf = rot_vf(g["rot"])
-        vf = f"{vf},format=bgr24" if vf else "format=bgr24"
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-noautorotate",
-               "-i", video_path, "-vf", vf, "-f", "rawvideo", "-y", self.raw_path]
+               "-i", video_path, "-vf", "format=bgr24",
+               "-f", "rawvideo", "-y", self.raw_path]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=TIME_HARD_SEC)
         if r.returncode != 0 or not os.path.exists(self.raw_path):
             raise ValueError(f"❌ فشل فك الفيديو: {r.stderr[-300:]}")
+        coded_bytes = g["w0"] * g["h0"] * 3
         sz = os.path.getsize(self.raw_path)
-        want = self.width * self.height * 3
-        coded = g["w0"] * g["h0"] * 3
-        if sz % want != 0 and sz % coded == 0 and coded != want:
-            # السيرفر دوّر من نفسه رغم -noautorotate → أعد الفك بدون transpose
-            try:
-                os.remove(self.raw_path)
-            except Exception:
-                pass
-            vf2 = "format=bgr24"
-            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-noautorotate",
-                   "-i", video_path, "-vf", vf2, "-f", "rawvideo", "-y", self.raw_path]
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=TIME_HARD_SEC)
-            if r.returncode != 0:
-                raise ValueError(f"❌ فشل إعادة الفك: {r.stderr[-300:]}")
-            sz = os.path.getsize(self.raw_path)
-            # الفريمات وصلت بأبعاد العرض بالفعل
-            self.frame_bytes = want
-        else:
-            self.frame_bytes = want
+        if sz % coded_bytes != 0:
+            raise ValueError("❌ أبعاد الفك الخام ما تطابق الملف")
+        self.raw_f = open(self.raw_path, "rb")
+        first_buf = self.raw_f.read(coded_bytes)
+        self.raw_f.seek(0)
+        coded0 = np.frombuffer(first_buf, dtype=np.uint8).reshape(g["h0"], g["w0"], 3)
+
+        # ✅✅✅ المعايرة: أي تحويل يطابق بصمة وأبعاد عرض ملفك الأصلي؟
+        in_dims, in_sig = first_frame_sig(video_path)
+        self.calib_sim = 0.0
+        self.rot_pick = 0
+        self.sar_stretch = abs(g["sar_val"] - 1.0) > 0.001
+        best = None
+        for t in (0, 90, 180, 270):
+            f = coded0
+            if self.sar_stretch:
+                f = cv2.resize(f, (int(round(g["w0"] * g["sar_val"])), g["h0"]),
+                               interpolation=cv2.INTER_LINEAR)
+            f = rot_frame(f, t)
+            dims = (f.shape[1], f.shape[0])
+            if in_dims is not None and dims != in_dims:
+                continue
+            s = float((sig_of(f) * in_sig).mean()) if in_sig is not None else 1.0
+            if best is None or s > best[1]:
+                best = (t, s, dims)
+        if best is None:
+            # fallback: أبعاد عرض المشغل القياسي
+            if g["rot"] in (90, 270):
+                dims = (g["h0"], g["w0"])
+            else:
+                dims = (g["w0"], g["h0"])
+            best = (g["rot"] % 360, 0.0, dims)
+        self.rot_pick, self.calib_sim, dims = best[0], best[1], best[2]
+        self.width, self.height = dims[0] + dims[0] % 2, dims[1] + dims[1] % 2
+        self.in_png_dims = in_dims
+        self.frame_bytes = g["w0"] * g["h0"] * 3
+        self.coded_w, self.coded_h = g["w0"], g["h0"]
         self.total_frames = sz // self.frame_bytes
         if self.total_frames <= 0:
             raise ValueError("❌ ملف الفيديو الخام فاضي")
         if g["total"] > 0:
             self.total_frames = min(self.total_frames, g["total"] + 2)
-        self.raw_f = open(self.raw_path, "rb")
-        print(f"✅ نهائي: {self.width}x{self.height} | دخل: {g['w0']}x{g['h0']} sar={g['sar_str']} rot={g['rot']} | فريمات: {self.total_frames}")
+        print(f"✅ معايرة: rot_pick={self.rot_pick} sim={self.calib_sim:.3f} | عرض={self.width}x{self.height} | دخل PNG={in_dims}")
 
         br_m = self.src_bitrate / 1_000_000 if self.src_bitrate else 0
         cap_m = max(6.0, min(12.0, br_m * 2.2)) if br_m > 0 else 8.0
@@ -304,6 +351,17 @@ class FloatingWatermark:
                 os.remove(self.raw_path)
         except Exception:
             pass
+
+    # ✅ تحويل مخزن → عرض حسب المعايرة
+    def _to_display(self, f):
+        if self.sar_stretch:
+            f = cv2.resize(f, (int(round(self.coded_w * self.in_geo["sar_val"])), self.coded_h),
+                           interpolation=cv2.INTER_LINEAR)
+        if self.rot_pick:
+            f = rot_frame(f, self.rot_pick)
+        if f.shape[1] != self.width or f.shape[0] != self.height:
+            f = cv2.resize(f, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
+        return f
 
     def _get_font_path(self):
         for p in [os.path.join(TEMP_DIR, "Poppins-Medium.ttf"),
@@ -621,7 +679,7 @@ class FloatingWatermark:
             bind_gain = random.uniform(6.0, 8.0)
             bind_amod = random.uniform(0.40, 0.60)
             pz_rot_amp = math.radians(random.uniform(1.3, 2.2))
-            pz_gam_amp = math.radians(0.13) if False else random.uniform(0.13, 0.20)
+            pz_gam_amp = random.uniform(0.13, 0.20)
         elif prof < 0.30:
             op_mid, op_amp = random.uniform(0.35, 0.50), random.uniform(0.08, 0.14)
         elif prof < 0.60:
@@ -990,7 +1048,8 @@ class FloatingWatermark:
                 frame[y0:y1, x0:x1].astype(np.float32) + add[:, :, None], 0, 255).astype(np.uint8)
         return frame
 
-    def process_frame(self, frame, frame_num):
+    def process_frame(self, coded_frame, frame_num):
+        frame = self._to_display(coded_frame)
         out = frame
         blur_s = cv2.blur(out, (3, 3))
         out = np.clip(out.astype(np.float32) * 1.30 - blur_s.astype(np.float32) * 0.30,
@@ -1076,7 +1135,7 @@ class FloatingWatermark:
             buf = self.raw_f.read(self.frame_bytes)
             if len(buf) < self.frame_bytes:
                 break
-            frame = np.frombuffer(buf, dtype=np.uint8).reshape(self.height, self.width, 3)
+            frame = np.frombuffer(buf, dtype=np.uint8).reshape(self.coded_h, self.coded_w, 3)
             n += 1
             self.enc.write(self.process_frame(frame, n))
             if progress_cb is not None and n % 20 == 0:
@@ -1196,15 +1255,19 @@ async def process_job(job):
             await msg.edit_text("❌ فشل إنشاء الفيديو")
             return
         out_line = probe_geom_line(out)
+        out_dims, _ = first_frame_sig(out)
         sz = os.path.getsize(out) / (1024 ** 2)
         if sz > 500:
             await msg.edit_text(f"❌ الحجم {sz:.1f}MB أكبر من 500MB")
             return
         job["stage"] = "upload"
+        calib = (f"🧠 معايرة: تدوير={w.rot_pick} تشابه={w.calib_sim:.2f}\n"
+                 f"🖼 عرض دخل={w.in_png_dims} | عرض خرج={out_dims}")
         await message.reply_video(out, caption=(
             "✓ تمت إضافة الحقوق 🎬\n\n"
             f"📥 دخل: {in_line}\n"
             f"📤 خرج: {out_line}\n"
+            f"{calib}\n"
             "🖤 Telegram:@vamp1r3s أسود واضح 88%\n"
             "🖋 40 نص + 6 مراسي مدمرة | 🛡️ مضاد dewatermark\n\n"
             f"⏱ المعالجة: {fmt_time(elapsed)}"))
@@ -1247,9 +1310,10 @@ async def worker():
 @app.on_message(filters.command("start"))
 async def start(c, m):
     await m.reply("👋 هلا! 🎬\n\nأرسل فيديو وأضيف الحقوق:\n\n"
-                  "📐 أبعاد مطابقة لعرض تيليجرام لمقطعك\n"
+                  "🧠 معايرة ذاتية: الاتجاه ينقاس من محتوى الفيديو نفسه\n"
+                  "📐 أبعاد مطابقة لعرض مقطعك الأصلي\n"
                   "🖤 Telegram:@vamp1r3s أسود واضح أغمق من الكل\n"
-                  "🖋 40 نص + مراسي مدمرة للإزالة\n"
+                  "🖋 40 نص + مراسي مدمرة | 🛡️ مضاد dewatermark\n"
                   "👁 مقطع صافي ومريح | 🚀 سريع")
 
 
@@ -1276,7 +1340,7 @@ async def status(c, m):
 async def main():
     print("🤖 تشغيل البوت...")
     await app.start()
-    print("✓ البوت شغال | تقرير هندسة دخل/خرج بكل نتيجة")
+    print("✓ البوت شغال | معايرة ذاتية بالبصمة + تقرير هندسة كامل")
     asyncio.create_task(worker())
     try:
         from pyrogram import idle
