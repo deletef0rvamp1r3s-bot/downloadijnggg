@@ -36,7 +36,7 @@ ENCODE_CRF = 20
 ENCODE_PRESET = "superfast"
 TIME_HARD_SEC = 29 * 60
 
-STRONG_COUNT = 40
+STRONG_COUNT = 60   # ✅ 60 نص
 FLICK_COUNT = 3
 GHOST_COUNT = 2
 MAX_QUEUE = 6
@@ -186,8 +186,6 @@ class PipeEncoder:
             cmd += ["-map", "1:a:0?"]
         cmd += ["-c:v", "libx264", "-crf", str(crf), "-preset", preset,
                 "-pix_fmt", "yuv420p", "-profile:v", "high",
-                # ✅✅✅ الإصلاح النهائي: بصمة ترميز مطابقة لبوت التجميع
-                # (تيليجرام يعرضها عمودي داخل التطبيق بدون حفظ)
                 "-bf", "0",
                 "-level", "4.0",
                 "-vf", "setsar=1:1",
@@ -281,6 +279,11 @@ class FloatingWatermark:
             raise ValueError("❌ ملف الفيديو الخام فاضي")
         if g["total"] > 0:
             self.total_frames = min(self.total_frames, g["total"] + 2)
+
+        # ✅ Thumbnail: نلتقط فريم حقيقي بالحقوق من ثلث المقطع
+        self.thumb_path = output_path + ".thumb.jpg"
+        self._thumb_at = max(30, self.total_frames // 3)
+        self._thumb_done = False
         print(f"✅ معايرة: rot_pick={self.rot_pick} sim={self.calib_sim:.3f} | عرض={self.width}x{self.height}")
 
         br_m = self.src_bitrate / 1_000_000 if self.src_bitrate else 0
@@ -312,8 +315,9 @@ class FloatingWatermark:
         self.strong_min_font = strong_min
         self.strong_max_font = strong_max
         self.vip_font_size = vip_size
-        self.grid_cols = 7
-        self.grid_rows = 8
+        # ✅ شبكة أوسع لتوزيع 60 نص بعشوائية منتظمة
+        self.grid_cols = 8
+        self.grid_rows = 9
         self._cell_queue = []
         self._bottom_queue = []
         self.top_fade_margin = 80
@@ -350,11 +354,12 @@ class FloatingWatermark:
                 self.raw_f.close()
         except Exception:
             pass
-        try:
-            if os.path.exists(self.raw_path):
-                os.remove(self.raw_path)
-        except Exception:
-            pass
+        for p in (self.raw_path, self.thumb_path):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
 
     def _to_display(self, f):
         if self.sar_stretch:
@@ -455,7 +460,7 @@ class FloatingWatermark:
             img = Image.fromarray(arr0)
         arr = np.array(img)
         sprite = arr[:, :, [2, 1, 0, 3]].copy()
-        if len(self._sprite_cache) > 400:
+        if len(self._sprite_cache) > 500:
             self._sprite_cache.clear()
         self._sprite_cache[key] = sprite
         return sprite
@@ -667,41 +672,41 @@ class FloatingWatermark:
         fx_nyq = random.uniform(*NYQ_AMP)
         fx_bayer = random.uniform(*BAYER_AMP)
         fx_echo = random.uniform(0.30, 0.42)
-        bind_gain = random.uniform(4.5, 7.0)
-        bind_amod = random.uniform(0.30, 0.50)
+        bind_gain = random.uniform(5.0, 7.5)
+        bind_amod = random.uniform(0.32, 0.52)
         pz_rot_amp = math.radians(random.uniform(0.8, 1.6))
         pz_gam_amp = random.uniform(0.08, 0.13)
         is_opaque = False
 
         prof = random.random()
         if anchor:
-            op_mid, op_amp = random.uniform(0.55, 0.65), random.uniform(0.04, 0.08)
+            op_mid, op_amp = random.uniform(0.55, 0.68), random.uniform(0.04, 0.08)
             fx_nyq = random.uniform(8.0, 14.0)
             fx_bayer = random.uniform(10.0, 16.0)
             fx_echo = random.uniform(0.55, 0.75)
-            bind_gain = random.uniform(7.0, 9.5)
-            bind_amod = random.uniform(0.45, 0.65)
+            bind_gain = random.uniform(7.5, 10.0)
+            bind_amod = random.uniform(0.48, 0.68)
             pz_rot_amp = math.radians(random.uniform(1.3, 2.2))
             pz_gam_amp = random.uniform(0.13, 0.20)
         elif prof < 0.30:
-            op_mid, op_amp = random.uniform(0.35, 0.50), random.uniform(0.08, 0.14)
+            op_mid, op_amp = random.uniform(0.38, 0.52), random.uniform(0.08, 0.14)
         elif prof < 0.60:
-            op_mid, op_amp = 0.60, 0.0
+            op_mid, op_amp = 0.65, 0.0
             is_opaque = True
             fx_nyq = random.uniform(7.0, 13.0)
             fx_bayer = random.uniform(9.0, 15.0)
             fx_echo = random.uniform(0.50, 0.65)
-            bind_gain = random.uniform(6.0, 8.0)
-            bind_amod = random.uniform(0.40, 0.55)
+            bind_gain = random.uniform(6.5, 8.5)
+            bind_amod = random.uniform(0.42, 0.58)
             pz_rot_amp = math.radians(random.uniform(1.2, 2.0))
             pz_gam_amp = random.uniform(0.12, 0.18)
         else:
-            op_mid, op_amp = random.uniform(0.30, 0.55), random.uniform(0.08, 0.16)
+            op_mid, op_amp = random.uniform(0.32, 0.58), random.uniform(0.08, 0.16)
             fx_nyq = random.uniform(8.0, 14.0)
             fx_bayer = random.uniform(10.0, 16.0)
             fx_echo = random.uniform(0.55, 0.75)
-            bind_gain = random.uniform(7.0, 9.5)
-            bind_amod = random.uniform(0.45, 0.65)
+            bind_gain = random.uniform(7.5, 10.0)
+            bind_amod = random.uniform(0.48, 0.68)
             pz_rot_amp = math.radians(random.uniform(1.3, 2.2))
             pz_gam_amp = random.uniform(0.13, 0.20)
 
@@ -739,7 +744,7 @@ class FloatingWatermark:
             "pz_par_sign": random.choice([-1.0, 1.0]),
             "fx_color_drift_freq": random.uniform(0.06, 0.12),
             "fx_color_drift_phase": random.uniform(0, math.pi * 2),
-            "fx_color_drift_amp": random.uniform(5, 10),
+            "fx_color_drift_amp": random.uniform(6, 11),
             "fx_jx_amp": j_amp, "fx_jy_amp": j_amp * random.uniform(0.7, 1.1),
             "fx_jx_freq": random.uniform(0.05, 0.12),
             "fx_jy_freq": random.uniform(0.04, 0.10),
@@ -748,7 +753,7 @@ class FloatingWatermark:
             "fx_echo": fx_echo, "fx_refl": random.uniform(30.0, 42.0),
             "bind_gain": bind_gain, "bind_amod": bind_amod,
             "fx_grad_dir": random.choice([0, 1, 2]), "fx_grad_strength": random.uniform(0.25, 0.55),
-            "fx_morph_amp": random.uniform(0.4, 0.7),
+            "fx_morph_amp": random.uniform(0.45, 0.75),
             "fx_morph_freq": random.uniform(0.10, 0.20),
             "fx_lum_flick": random.uniform(0.03, 0.06),
             "fx_lum_freq": random.uniform(0.08, 0.15),
@@ -1083,7 +1088,7 @@ class FloatingWatermark:
             else:
                 wave = math.sin(2 * math.pi * t / wm["op_period"] + wm["op_phase"])
                 alpha = fade * (wm["op_mid"] + wm["op_amp"] * wave)
-            alpha = max(0.25, min(0.65, alpha))
+            alpha = max(0.28, min(0.68, alpha))
             if wm["y"] < self.top_fade_margin:
                 fade_top = max(0.0, wm["y"] / self.top_fade_margin)
                 alpha *= fade_top
@@ -1140,7 +1145,20 @@ class FloatingWatermark:
                 break
             frame = np.frombuffer(buf, dtype=np.uint8).reshape(self.coded_h, self.coded_w, 3)
             n += 1
-            self.enc.write(self.process_frame(frame, n))
+            done = self.process_frame(frame, n)
+            # ✅ التقاط المصغرة: فريم حقيقي مرسوم عليه الحقوق
+            if not self._thumb_done and n >= self._thumb_at:
+                try:
+                    th = done
+                    h0, w0 = th.shape[:2]
+                    sc = 640.0 / max(h0, w0)
+                    if sc < 1.0:
+                        th = cv2.resize(th, (int(w0 * sc), int(h0 * sc)))
+                    cv2.imwrite(self.thumb_path, th, [int(cv2.IMWRITE_JPEG_QUALITY), 87])
+                    self._thumb_done = True
+                except Exception:
+                    self._thumb_done = True
+            self.enc.write(done)
             if progress_cb is not None and n % 20 == 0:
                 progress_cb(n, self.total_frames)
         if progress_cb is not None:
@@ -1270,15 +1288,17 @@ async def process_job(job):
         calib = (f"🧠 معايرة: تدوير={w.rot_pick} تشابه={w.calib_sim:.2f}\n"
                  f"🖼 عرض دخل={in_dims2} | عرض خرج={out_dims} | تطابق بكسل={sim_out:.2f}")
         dur_sec = int(round(w.total_frames / w.fps)) if w.fps > 0 else 0
+        thumb_arg = w.thumb_path if os.path.exists(w.thumb_path) else None
         await message.reply_video(
             out,
+            thumb=thumb_arg,
             caption=(
                 "✓ تمت إضافة الحقوق 🎬\n\n"
                 f"📥 دخل: {in_line}\n"
                 f"📤 خرج: {out_line}\n"
                 f"{calib}\n"
                 "🖤 Telegram:@vamp1r3s أسود واضح 88%\n"
-                "🖋 40 نص + مراسي قوية + سموم ذكية\n"
+                "🖋 60 نص + مراسي قوية + سموم ذكية\n"
                 "🛡️ مضاد Dewatermark.ai\n\n"
                 f"⏱ المعالجة: {fmt_time(elapsed)}"),
             duration=dur_sec,
@@ -1325,10 +1345,10 @@ async def worker():
 @app.on_message(filters.command("start"))
 async def start(c, m):
     await m.reply("👋 هلا! 🎬\n\nأرسل فيديو وأضيف الحقوق:\n\n"
-                  "🧠 معايرة ذاتية من محتوى الفيديو\n"
+                  "🖋 60 نص بتوزيع عشوائي منتظم\n"
+                  "🖼 مصغرة حقيقية من المقطع (بدون رمادي)\n"
                   "🛡️ سموم ذكية ضد Dewatermark.ai\n"
                   "🖤 Telegram:@vamp1r3s أسود واضح\n"
-                  "🖋 40 نص + مراسي قوية\n"
                   "📺 عرض عمودي سليم داخل تيليجرام\n"
                   "👁 مقطع صافي | 🚀 سريع | 💾 حجم معقول")
 
@@ -1356,7 +1376,7 @@ async def status(c, m):
 async def main():
     print("🤖 تشغيل البوت...")
     await app.start()
-    print("✓ البوت شغال | CRF 20 + bf=0 + level 4.0 = عرض سليم داخل تيليجرام")
+    print("✓ البوت شغال | 60 نص + مصغرة حقيقية + عرض سليم")
     asyncio.create_task(worker())
     try:
         from pyrogram import idle
