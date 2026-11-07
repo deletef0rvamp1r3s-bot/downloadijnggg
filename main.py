@@ -53,9 +53,8 @@ STROKE_GAMMA = True
 TEXT_PARITY = True
 PARITY_AMP_TEXT = 2.5
 PARITY_BLOCK = 8
-# ✅ سموم ذكية: خفيفة ضغطياً + قوية ضد dewatermark
-NYQ_AMP = (5.0, 9.0)      # خفّفناها (كانت 6-10)
-BAYER_AMP = (6.0, 11.0)   # خفّفناها (كانت 8-12)
+NYQ_AMP = (5.0, 9.0)
+BAYER_AMP = (6.0, 11.0)
 
 PROGRESS_INTERVAL = 2.0
 
@@ -187,6 +186,10 @@ class PipeEncoder:
             cmd += ["-map", "1:a:0?"]
         cmd += ["-c:v", "libx264", "-crf", str(crf), "-preset", preset,
                 "-pix_fmt", "yuv420p", "-profile:v", "high",
+                # ✅✅✅ الإصلاح النهائي: بصمة ترميز مطابقة لبوت التجميع
+                # (تيليجرام يعرضها عمودي داخل التطبيق بدون حفظ)
+                "-bf", "0",
+                "-level", "4.0",
                 "-vf", "setsar=1:1",
                 "-video_track_timescale", "90000",
                 "-g", str(max(30, int(fps * 2))),
@@ -524,7 +527,6 @@ class FloatingWatermark:
         frame[dy0:dy0 + (sy1 - sy0), dx0:dx0 + (sx1 - sx0)] = \
             np.clip(outp * 255.0, 0, 255).astype(np.uint8)
 
-    # ✅✅✅ سلاح مضاد لـ dewatermark: adaptive bind أقوى
     def _adaptive_bind(self, sprite, detail, edges, texture, x, y, gain, amod):
         if sprite is None or detail is None:
             return sprite
@@ -548,7 +550,6 @@ class FloatingWatermark:
         spr = sprite.copy()
         mask = (spr[:, :, 3] > 10).astype(np.float32)
         rgb = spr[:, :, :3].astype(np.float32)
-        # ✅ gain أعلى = ربط أقوى بالمحتوى = dewatermark ما يقدر يفصل النص عن الخلفية
         rgb += dmap[:, :, None] * gain * 1.3 * mask[:, :, None]
         edge_weight = np.clip(emap / 100.0, 0, 1)
         rgb += emap[:, :, None] * (gain * 0.8) * edge_weight[:, :, None] * mask[:, :, None]
@@ -644,7 +645,6 @@ class FloatingWatermark:
         return best if best is not None else (x, y)
 
     def _make_watermark(self, wm_type):
-        # ✅ المراسي أكثر احتمالاً = أقوى ضد inpainting
         anchor = (wm_type == "strong" and random.random() < 0.22)
         if anchor:
             font_size = random.randint(self.strong_max_font, max(self.strong_max_font + 2, int(self.strong_max_font * 1.5)))
@@ -666,8 +666,7 @@ class FloatingWatermark:
 
         fx_nyq = random.uniform(*NYQ_AMP)
         fx_bayer = random.uniform(*BAYER_AMP)
-        fx_echo = random.uniform(0.30, 0.42)  # ✅ صدى أقوى (رخيص ضغطياً)
-        # ✅ adaptive bind أقوى
+        fx_echo = random.uniform(0.30, 0.42)
         bind_gain = random.uniform(4.5, 7.0)
         bind_amod = random.uniform(0.30, 0.50)
         pz_rot_amp = math.radians(random.uniform(0.8, 1.6))
@@ -706,7 +705,7 @@ class FloatingWatermark:
             pz_rot_amp = math.radians(random.uniform(1.3, 2.2))
             pz_gam_amp = random.uniform(0.13, 0.20)
 
-        blend = "overlay" if random.random() < 0.55 else "alpha"  # ✅ overlay أكثر
+        blend = "overlay" if random.random() < 0.55 else "alpha"
         prefer_detail = True if anchor else (random.random() < 0.55)
 
         life = max(30, int(life_s * self.fps))
@@ -740,7 +739,7 @@ class FloatingWatermark:
             "pz_par_sign": random.choice([-1.0, 1.0]),
             "fx_color_drift_freq": random.uniform(0.06, 0.12),
             "fx_color_drift_phase": random.uniform(0, math.pi * 2),
-            "fx_color_drift_amp": random.uniform(5, 10),  # ✅ انحراف ألوان أقوى (رخيص)
+            "fx_color_drift_amp": random.uniform(5, 10),
             "fx_jx_amp": j_amp, "fx_jy_amp": j_amp * random.uniform(0.7, 1.1),
             "fx_jx_freq": random.uniform(0.05, 0.12),
             "fx_jy_freq": random.uniform(0.04, 0.10),
@@ -749,7 +748,7 @@ class FloatingWatermark:
             "fx_echo": fx_echo, "fx_refl": random.uniform(30.0, 42.0),
             "bind_gain": bind_gain, "bind_amod": bind_amod,
             "fx_grad_dir": random.choice([0, 1, 2]), "fx_grad_strength": random.uniform(0.25, 0.55),
-            "fx_morph_amp": random.uniform(0.4, 0.7),   # ✅ morph أقوى (يكسر edge detection)
+            "fx_morph_amp": random.uniform(0.4, 0.7),
             "fx_morph_freq": random.uniform(0.10, 0.20),
             "fx_lum_flick": random.uniform(0.03, 0.06),
             "fx_lum_freq": random.uniform(0.08, 0.15),
@@ -774,7 +773,6 @@ class FloatingWatermark:
         np.random.seed((frame_num * 7919) % (2**32))
         spr[:, 1:, 2] = spr[:, :-1, 2]
         spr[:, :-1, 0] = spr[:, 1:, 0]
-        # ✅ ضوضاء ألطف (أخذنا من -2,+3 بدل -3,+4)
         noise = np.random.randint(-2, 3, size=(H, W, 3), dtype=np.int16)
         mask3 = np.stack([mask]*3, axis=-1)
         spr_int16 = spr[:, :, :3].astype(np.int16)
@@ -1271,15 +1269,23 @@ async def process_job(job):
         job["stage"] = "upload"
         calib = (f"🧠 معايرة: تدوير={w.rot_pick} تشابه={w.calib_sim:.2f}\n"
                  f"🖼 عرض دخل={in_dims2} | عرض خرج={out_dims} | تطابق بكسل={sim_out:.2f}")
-        await message.reply_video(out, caption=(
-            "✓ تمت إضافة الحقوق 🎬\n\n"
-            f"📥 دخل: {in_line}\n"
-            f"📤 خرج: {out_line}\n"
-            f"{calib}\n"
-            "🖤 Telegram:@vamp1r3s أسود واضح 88%\n"
-            "🖋 40 نص + مراسي قوية + سموم ذكية\n"
-            "🛡️ مضاد Dewatermark.ai\n\n"
-            f"⏱ المعالجة: {fmt_time(elapsed)}"))
+        dur_sec = int(round(w.total_frames / w.fps)) if w.fps > 0 else 0
+        await message.reply_video(
+            out,
+            caption=(
+                "✓ تمت إضافة الحقوق 🎬\n\n"
+                f"📥 دخل: {in_line}\n"
+                f"📤 خرج: {out_line}\n"
+                f"{calib}\n"
+                "🖤 Telegram:@vamp1r3s أسود واضح 88%\n"
+                "🖋 40 نص + مراسي قوية + سموم ذكية\n"
+                "🛡️ مضاد Dewatermark.ai\n\n"
+                f"⏱ المعالجة: {fmt_time(elapsed)}"),
+            duration=dur_sec,
+            width=w.width,
+            height=w.height,
+            supports_streaming=True,
+        )
         await msg.edit_text(f"✅ انتهى!\n⏱ {fmt_time(elapsed)}\n💾 {sz:.1f}MB\n📚 بالانتظار: {JOB_QUEUE.qsize()}")
     except Exception as e:
         print(f"❌ خطأ: {e}")
@@ -1323,6 +1329,7 @@ async def start(c, m):
                   "🛡️ سموم ذكية ضد Dewatermark.ai\n"
                   "🖤 Telegram:@vamp1r3s أسود واضح\n"
                   "🖋 40 نص + مراسي قوية\n"
+                  "📺 عرض عمودي سليم داخل تيليجرام\n"
                   "👁 مقطع صافي | 🚀 سريع | 💾 حجم معقول")
 
 
@@ -1349,7 +1356,7 @@ async def status(c, m):
 async def main():
     print("🤖 تشغيل البوت...")
     await app.start()
-    print("✓ البوت شغال | CRF 20 + سموم ذكية ضد Dewatermark.ai")
+    print("✓ البوت شغال | CRF 20 + bf=0 + level 4.0 = عرض سليم داخل تيليجرام")
     asyncio.create_task(worker())
     try:
         from pyrogram import idle
