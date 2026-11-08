@@ -36,7 +36,7 @@ ENCODE_CRF = 20
 ENCODE_PRESET = "superfast"
 TIME_HARD_SEC = 29 * 60
 
-STRONG_COUNT = 60   # ✅ 60 نص
+STRONG_COUNT = 50   # ✅ 50 نص
 FLICK_COUNT = 3
 GHOST_COUNT = 2
 MAX_QUEUE = 6
@@ -230,6 +230,10 @@ class FloatingWatermark:
         self.fps = g["fps"] if g["fps"] > 0 else 30.0
         self.src_bitrate = g["bitrate"]
 
+        # ✅✅ بوت التجميع يضاعف الفريمات لـ60fps (توائم مكررة) → نعالج نصها فقط
+        self.step = 2 if self.fps >= 50 else 1
+        self.out_fps = self.fps / self.step
+
         self.raw_path = output_path + ".raw"
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-noautorotate",
                "-i", video_path, "-vf", "format=bgr24",
@@ -274,22 +278,24 @@ class FloatingWatermark:
         self.in_png_dims = in_dims
         self.frame_bytes = coded_bytes
         self.coded_w, self.coded_h = g["w0"], g["h0"]
-        self.total_frames = sz // self.frame_bytes
-        if self.total_frames <= 0:
+        raw_total = sz // self.frame_bytes
+        if raw_total <= 0:
             raise ValueError("❌ ملف الفيديو الخام فاضي")
         if g["total"] > 0:
-            self.total_frames = min(self.total_frames, g["total"] + 2)
+            raw_total = min(raw_total, g["total"] + 2)
+        self.total_frames = raw_total
+        self.total_out = max(1, raw_total // self.step)
 
-        # ✅ Thumbnail: نلتقط فريم حقيقي بالحقوق من ثلث المقطع
         self.thumb_path = output_path + ".thumb.jpg"
-        self._thumb_at = max(30, self.total_frames // 3)
+        self._thumb_at = max(10, self.total_out // 3)
         self._thumb_done = False
-        print(f"✅ معايرة: rot_pick={self.rot_pick} sim={self.calib_sim:.3f} | عرض={self.width}x{self.height}")
+        print(f"✅ معايرة: rot={self.rot_pick} sim={self.calib_sim:.3f} | {self.width}x{self.height} | "
+              f"fps {self.fps:.0f}→{self.out_fps:.0f} | فريمات معالجة: {self.total_out}")
 
         br_m = self.src_bitrate / 1_000_000 if self.src_bitrate else 0
         cap_m = max(3.0, min(6.0, br_m * 2.0)) if br_m > 0 else 4.0
         self.maxrate = f"{cap_m:.0f}M"
-        self.enc = PipeEncoder(self.width, self.height, self.fps, output_path,
+        self.enc = PipeEncoder(self.width, self.height, self.out_fps, output_path,
                                audio_src, ENCODE_CRF, ENCODE_PRESET, self.maxrate)
         self.text_variants = ["Tel:@vamp1r3s"]
         self.vip_text = "Telegram:@vamp1r3s"
@@ -315,7 +321,6 @@ class FloatingWatermark:
         self.strong_min_font = strong_min
         self.strong_max_font = strong_max
         self.vip_font_size = vip_size
-        # ✅ شبكة أوسع لتوزيع 60 نص بعشوائية منتظمة
         self.grid_cols = 8
         self.grid_rows = 9
         self._cell_queue = []
@@ -583,11 +588,11 @@ class FloatingWatermark:
         x = col * cw + cw * random.uniform(0.1, 0.9) - est_w / 2
         y = row * ch + ch * random.uniform(0.1, 0.9) - est_h / 2
         x = max(2, min(x, self.width - est_w - 2)); y = max(2, min(y, self.height - est_h - 2))
-        life = max(40, int(random.uniform(6, 10) * self.fps))
+        life = max(40, int(random.uniform(6, 10) * self.out_fps))
         return {"x": x, "y": y, "vy_ps": random.uniform(60, 120), "font_size": size,
                 "base_alpha": random.uniform(0.020, 0.035), "life": life,
-                "age": random.randint(0, max(1, int(0.5 * self.fps))),
-                "fade_in": max(8, int(self.fps)), "fade_out": max(8, int(1.5 * self.fps)),
+                "age": random.randint(0, max(1, int(0.5 * self.out_fps))),
+                "fade_in": max(8, int(self.out_fps)), "fade_out": max(8, int(1.5 * self.out_fps)),
                 "bind_gain": random.uniform(4.0, 6.0), "bind_amod": random.uniform(0.25, 0.40),
                 "text_idx": 0, "vary_seed": random.randint(1, 10**9), "anchor": False}
 
@@ -713,9 +718,9 @@ class FloatingWatermark:
         blend = "overlay" if random.random() < 0.55 else "alpha"
         prefer_detail = True if anchor else (random.random() < 0.55)
 
-        life = max(30, int(life_s * self.fps))
-        fi = max(6, int(0.7 * self.fps))
-        fo = max(10, int(1.3 * self.fps))
+        life = max(30, int(life_s * self.out_fps))
+        fi = max(6, int(0.7 * self.out_fps))
+        fo = max(10, int(1.3 * self.out_fps))
         x, y = self._spawn_position(font_size, prefer_detail=prefer_detail)
 
         return {
@@ -829,7 +834,7 @@ class FloatingWatermark:
         if sprite is None:
             return sprite, orig_x, orig_y
         H, W = sprite.shape[:2]
-        t = frame_num / self.fps
+        t = frame_num / self.out_fps
         ph, ph2 = wm.get("fx_phase", 0.0), wm.get("fx_phase2", 0.0)
         life = wm.get("life", 0)
         p = min(1.0, max(0.0, wm.get("age", 0) / float(life))) if life else ((t % 6.0) / 6.0)
@@ -998,7 +1003,7 @@ class FloatingWatermark:
         self.vip["t"] += dt
         t = self.vip["t"]
         alpha = 0.88 + 0.01 * math.sin(t * 0.4)
-        fade_f = max(10, int(0.8 * self.fps))
+        fade_f = max(10, int(0.8 * self.out_fps))
         if self.vip["age"] < fade_f:
             alpha *= self.vip["age"] / fade_f
         mx, my = sw / 2 + 20, sh / 2 + 20
@@ -1062,7 +1067,7 @@ class FloatingWatermark:
         blur_s = cv2.blur(out, (3, 3))
         out = np.clip(out.astype(np.float32) * 1.30 - blur_s.astype(np.float32) * 0.30,
                       0, 255).astype(np.uint8)
-        t = frame_num / self.fps
+        t = frame_num / self.out_fps
         if self._frame_detail is None or (frame_num - self._maps_frame) >= 4:
             gray = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
             self._frame_detail = gray.astype(np.float32) - cv2.blur(gray, (5, 5)).astype(np.float32)
@@ -1073,7 +1078,7 @@ class FloatingWatermark:
             self._maps_frame = frame_num
         rects = []
         for idx, wm in enumerate(self.watermarks):
-            wm["y"] -= wm["vy_ps"] / self.fps
+            wm["y"] -= wm["vy_ps"] / self.out_fps
             wm["age"] += 1
             txt = self.text_variants[wm.get("text_idx", 0)]
             sprite = self._make_sprite(txt, wm["font_size"], bold=False,
@@ -1116,8 +1121,8 @@ class FloatingWatermark:
             else:
                 self._blend_sprite(out, sprite, x, y, alpha)
             rects.append((int(x), int(y), sw, sh))
-        self._process_vip(out, 1.0 / self.fps, frame_num, rects)
-        dt = 1.0 / self.fps
+        self._process_vip(out, 1.0 / self.out_fps, frame_num, rects)
+        dt = 1.0 / self.out_fps
         for g in self.ghosts:
             g["y"] -= g["vy_ps"] * dt
             g["age"] += 1
@@ -1138,15 +1143,19 @@ class FloatingWatermark:
 
     def run(self, progress_cb=None, job=None):
         n = 0
+        idx = 0
         t0 = time.time()
         while True:
             buf = self.raw_f.read(self.frame_bytes)
             if len(buf) < self.frame_bytes:
                 break
+            idx += 1
+            # ✅ نتخطى الفريمات المكررة (60fps توأم) → نصف الشغل بنفس الحركة الحقيقية
+            if self.step > 1 and (idx % self.step) != 1:
+                continue
             frame = np.frombuffer(buf, dtype=np.uint8).reshape(self.coded_h, self.coded_w, 3)
             n += 1
             done = self.process_frame(frame, n)
-            # ✅ التقاط المصغرة: فريم حقيقي مرسوم عليه الحقوق
             if not self._thumb_done and n >= self._thumb_at:
                 try:
                     th = done
@@ -1155,16 +1164,20 @@ class FloatingWatermark:
                     if sc < 1.0:
                         th = cv2.resize(th, (int(w0 * sc), int(h0 * sc)))
                     cv2.imwrite(self.thumb_path, th, [int(cv2.IMWRITE_JPEG_QUALITY), 87])
-                    self._thumb_done = True
                 except Exception:
-                    self._thumb_done = True
+                    pass
+                self._thumb_done = True
             self.enc.write(done)
             if progress_cb is not None and n % 20 == 0:
-                progress_cb(n, self.total_frames)
+                progress_cb(n, self.total_out)
         if progress_cb is not None:
-            progress_cb(self.total_frames, self.total_frames)
+            progress_cb(self.total_out, self.total_out)
         self.enc.close()
-        self.close()
+        # ✅ لا نحذف المصغرة هنا — تحذف بعد الإرسال بـ close()
+        try:
+            self.raw_f.close()
+        except Exception:
+            pass
         return time.time() - t0
 
 
@@ -1186,31 +1199,6 @@ def bar(pct, length=12):
 def fmt_time(s):
     s = max(0, int(s))
     return f"{s // 60:02d}:{s % 60:02d}"
-
-
-def probe_geom_line(path):
-    pr = probe_video(path)
-    if pr is None:
-        return "؟"
-    vs = None
-    for s in pr.get("streams", []):
-        if s.get("codec_type") == "video":
-            vs = s
-            break
-    if vs is None:
-        return "؟"
-    w = vs.get("width"); h = vs.get("height")
-    sar = vs.get("sample_aspect_ratio", "1:1")
-    rot = 0
-    ts = vs.get("time_base", "")
-    for sd in vs.get("side_data_list", []):
-        if "rotation" in sd:
-            try:
-                rot = int(float(sd["rotation"]))
-            except Exception:
-                pass
-            break
-    return f"{w}x{h} sar={sar} rot={rot} tb={ts}"
 
 
 async def progress_updater(job):
@@ -1254,12 +1242,11 @@ async def process_job(job):
         if not os.path.exists(inp) or os.path.getsize(inp) == 0:
             await msg.edit_text("❌ فشل تحميل الفيديو")
             return
-        in_line = probe_geom_line(inp)
         job["stage"] = "watermark"
         job["frames_done"] = 0
         job["t0"] = time.time()
         w = FloatingWatermark(inp, out, audio_src=inp)
-        job["frames_total"] = w.total_frames
+        job["frames_total"] = w.total_out
         job["dims"] = f"{w.width}x{w.height}"
 
         def cb(n, total):
@@ -1276,31 +1263,18 @@ async def process_job(job):
         if not os.path.exists(out) or os.path.getsize(out) == 0:
             await msg.edit_text("❌ فشل إنشاء الفيديو")
             return
-        out_line = probe_geom_line(out)
-        out_dims, out_sig = first_frame_sig(out)
-        in_dims2, in_sig2 = first_frame_sig(inp)
-        sim_out = float((out_sig * in_sig2).mean()) if (out_sig is not None and in_sig2 is not None) else -1.0
         sz = os.path.getsize(out) / (1024 ** 2)
         if sz > 500:
             await msg.edit_text(f"❌ الحجم {sz:.1f}MB أكبر من 500MB")
             return
         job["stage"] = "upload"
-        calib = (f"🧠 معايرة: تدوير={w.rot_pick} تشابه={w.calib_sim:.2f}\n"
-                 f"🖼 عرض دخل={in_dims2} | عرض خرج={out_dims} | تطابق بكسل={sim_out:.2f}")
-        dur_sec = int(round(w.total_frames / w.fps)) if w.fps > 0 else 0
+        dur_sec = int(round(w.total_out / w.out_fps)) if w.out_fps > 0 else 0
         thumb_arg = w.thumb_path if os.path.exists(w.thumb_path) else None
+        # ✅ كابشن مختصر كما طلبت
         await message.reply_video(
             out,
             thumb=thumb_arg,
-            caption=(
-                "✓ تمت إضافة الحقوق 🎬\n\n"
-                f"📥 دخل: {in_line}\n"
-                f"📤 خرج: {out_line}\n"
-                f"{calib}\n"
-                "🖤 Telegram:@vamp1r3s أسود واضح 88%\n"
-                "🖋 60 نص + مراسي قوية + سموم ذكية\n"
-                "🛡️ مضاد Dewatermark.ai\n\n"
-                f"⏱ المعالجة: {fmt_time(elapsed)}"),
+            caption=f"✓ تمت المعالجة\n⏱ {fmt_time(elapsed)}",
             duration=dur_sec,
             width=w.width,
             height=w.height,
@@ -1345,12 +1319,11 @@ async def worker():
 @app.on_message(filters.command("start"))
 async def start(c, m):
     await m.reply("👋 هلا! 🎬\n\nأرسل فيديو وأضيف الحقوق:\n\n"
-                  "🖋 60 نص بتوزيع عشوائي منتظم\n"
-                  "🖼 مصغرة حقيقية من المقطع (بدون رمادي)\n"
+                  "🖋 50 نص بتوزيع عشوائي منتظم\n"
+                  "🖼 مصغرة حقيقية من المقطع\n"
                   "🛡️ سموم ذكية ضد Dewatermark.ai\n"
                   "🖤 Telegram:@vamp1r3s أسود واضح\n"
-                  "📺 عرض عمودي سليم داخل تيليجرام\n"
-                  "👁 مقطع صافي | 🚀 سريع | 💾 حجم معقول")
+                  "📺 عرض عمودي سليم | 🚀 سريع مرتين")
 
 
 @app.on_message(filters.video)
@@ -1376,7 +1349,7 @@ async def status(c, m):
 async def main():
     print("🤖 تشغيل البوت...")
     await app.start()
-    print("✓ البوت شغال | 60 نص + مصغرة حقيقية + عرض سليم")
+    print("✓ البوت شغال | 50 نص + معالجة 30fps ذكية + مصغرة مضمونة")
     asyncio.create_task(worker())
     try:
         from pyrogram import idle
