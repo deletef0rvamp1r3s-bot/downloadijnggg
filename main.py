@@ -36,7 +36,7 @@ ENCODE_CRF = 20
 ENCODE_PRESET = "superfast"
 TIME_HARD_SEC = 29 * 60
 
-STRONG_COUNT = 50   # ✅ 50 نص
+STRONG_COUNT = 50
 FLICK_COUNT = 3
 GHOST_COUNT = 2
 MAX_QUEUE = 6
@@ -230,7 +230,7 @@ class FloatingWatermark:
         self.fps = g["fps"] if g["fps"] > 0 else 30.0
         self.src_bitrate = g["bitrate"]
 
-        # ✅✅ بوت التجميع يضاعف الفريمات لـ60fps (توائم مكررة) → نعالج نصها فقط
+        # ✅ بوت التجميع يضاعف الفريمات لـ60fps (توائم مكررة) → نعالج نصفها فقط
         self.step = 2 if self.fps >= 50 else 1
         self.out_fps = self.fps / self.step
 
@@ -286,8 +286,9 @@ class FloatingWatermark:
         self.total_frames = raw_total
         self.total_out = max(1, raw_total // self.step)
 
+        # ✅✅ المصغرة = أول فريم بالضبط
         self.thumb_path = output_path + ".thumb.jpg"
-        self._thumb_at = max(10, self.total_out // 3)
+        self._thumb_at = 1
         self._thumb_done = False
         print(f"✅ معايرة: rot={self.rot_pick} sim={self.calib_sim:.3f} | {self.width}x{self.height} | "
               f"fps {self.fps:.0f}→{self.out_fps:.0f} | فريمات معالجة: {self.total_out}")
@@ -1150,12 +1151,12 @@ class FloatingWatermark:
             if len(buf) < self.frame_bytes:
                 break
             idx += 1
-            # ✅ نتخطى الفريمات المكررة (60fps توأم) → نصف الشغل بنفس الحركة الحقيقية
             if self.step > 1 and (idx % self.step) != 1:
                 continue
             frame = np.frombuffer(buf, dtype=np.uint8).reshape(self.coded_h, self.coded_w, 3)
             n += 1
             done = self.process_frame(frame, n)
+            # ✅ المصغرة تُلتقط من أول فريم معالَج (n=1)
             if not self._thumb_done and n >= self._thumb_at:
                 try:
                     th = done
@@ -1270,7 +1271,6 @@ async def process_job(job):
         job["stage"] = "upload"
         dur_sec = int(round(w.total_out / w.out_fps)) if w.out_fps > 0 else 0
         thumb_arg = w.thumb_path if os.path.exists(w.thumb_path) else None
-        # ✅ كابشن مختصر كما طلبت
         await message.reply_video(
             out,
             thumb=thumb_arg,
@@ -1320,10 +1320,10 @@ async def worker():
 async def start(c, m):
     await m.reply("👋 هلا! 🎬\n\nأرسل فيديو وأضيف الحقوق:\n\n"
                   "🖋 50 نص بتوزيع عشوائي منتظم\n"
-                  "🖼 مصغرة حقيقية من المقطع\n"
+                  "🖼 مصغرة = أول فريم من المقطع\n"
                   "🛡️ سموم ذكية ضد Dewatermark.ai\n"
                   "🖤 Telegram:@vamp1r3s أسود واضح\n"
-                  "📺 عرض عمودي سليم | 🚀 سريع مرتين")
+                  "📺 عرض عمودي سليم | 🚀 سريع | 💾 حجم معقول")
 
 
 @app.on_message(filters.video)
@@ -1349,7 +1349,7 @@ async def status(c, m):
 async def main():
     print("🤖 تشغيل البوت...")
     await app.start()
-    print("✓ البوت شغال | 50 نص + معالجة 30fps ذكية + مصغرة مضمونة")
+    print("✓ البوت شغال | مصغرة من أول فريم + 50 نص + سرعة مضاعفة")
     asyncio.create_task(worker())
     try:
         from pyrogram import idle
