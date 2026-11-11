@@ -175,7 +175,7 @@ def rot_frame(f, t):
 
 class PipeEncoder:
     def __init__(self, width, height, fps, out_path, audio_src,
-                 crf=ENCODE_CRF, preset=ENCODE_PRESET, maxrate=None):
+                 crf=ENCODE_CRF, preset=ENCODE_PRESET, maxrate=None, bufsize=None):
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
                "-f", "rawvideo", "-pix_fmt", "bgr24",
                "-s", f"{width}x{height}", "-r", f"{fps:.6f}", "-i", "pipe:0"]
@@ -193,9 +193,11 @@ class PipeEncoder:
                 "-g", str(max(30, int(fps * 2))),
                 "-keyint_min", str(max(15, int(fps))),
                 "-sc_threshold", "0",
-                "-x264-params", "aq-mode=3:aq-strength=0.9:ref=1:me=dia:subme=1:trellis=0:threads=0"]
+                "-x264-params", "aq-mode=3:aq-strength=1.0:ref=2:me=dia:subme=2:trellis=0:threads=0"]
         if maxrate:
-            cmd += ["-maxrate", maxrate, "-bufsize", str(int(maxrate.replace("M", "")) * 2) + "M"]
+            cmd += ["-maxrate", maxrate]
+        if bufsize:
+            cmd += ["-bufsize", bufsize]
         if audio_src and os.path.exists(audio_src):
             cmd += ["-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "128k"]
         cmd += ["-movflags", "+faststart", "-shortest", "-y", out_path]
@@ -291,11 +293,14 @@ class FloatingWatermark:
         print(f"✅ معايرة: rot={self.rot_pick} sim={self.calib_sim:.3f} | {self.width}x{self.height} | "
               f"fps {self.fps:.0f}→{self.out_fps:.0f} | فريمات معالجة: {self.total_out}")
 
+        # ✅ سقف بتريت أرفع مع bufsize أكبر = بدون اختناق بالمشاهد المعتمه
         br_m = self.src_bitrate / 1_000_000 if self.src_bitrate else 0
-        cap_m = max(3.0, min(8.0, br_m * 2.0)) if br_m > 0 else 5.0
+        cap_m = max(5.0, min(10.0, br_m * 2.5)) if br_m > 0 else 6.0
         self.maxrate = f"{cap_m:.0f}M"
+        self.bufsize = f"{int(cap_m * 2.5)}M"
         self.enc = PipeEncoder(self.width, self.height, self.out_fps, output_path,
-                               audio_src, ENCODE_CRF, ENCODE_PRESET, self.maxrate)
+                               audio_src, ENCODE_CRF, ENCODE_PRESET,
+                               self.maxrate, self.bufsize)
         self.text_variants = ["Tel:@vamp1r3s"]
         self.vip_text = "Telegram:@vamp1r3s"
         self.vip_vary = random.randint(1, 10**9)
@@ -1046,18 +1051,23 @@ class FloatingWatermark:
         r[:, :, 3] = np.clip(r[:, :, 3].astype(np.float32) * fade * rst, 0, 255).astype(np.uint8)
         self._blend_sprite(frame, r, x, y + sh + gap, alpha)
 
+    # ✅✅✅ Parity متكيّف مع الإضاءة: بالمعتم يخف (ما ينشاف) وبالمضيء قوة كاملة
     def _apply_text_parity(self, frame, rects, frame_num):
         if not TEXT_PARITY or not rects:
             return frame
         H, W = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        gray_s = cv2.blur(gray, (15, 15))
         for i, (rx, ry, rw, rh) in enumerate(rects):
             x0, y0 = max(0, rx - 8), max(0, ry - 8)
             x1, y1 = min(W, rx + rw + 8), min(H, ry + rh + 8)
             if x1 <= x0 or y1 <= y0:
                 continue
+            lum_r = float(gray_s[y0:y1, x0:x1].mean())
+            factor = float(np.clip((lum_r - 40.0) / 50.0, 0.15, 1.0))
             sgn = 1.0 if (i % 2 == 0) else -1.0
             sub = self._parity1[y0:y1, x0:x1]
-            add = sgn * sub * PARITY_AMP_TEXT
+            add = sgn * sub * PARITY_AMP_TEXT * factor
             frame[y0:y1, x0:x1] = np.clip(
                 frame[y0:y1, x0:x1].astype(np.float32) + add[:, :, None], 0, 255).astype(np.uint8)
         return frame
@@ -1066,22 +1076,35 @@ class FloatingWatermark:
         frame = self._to_display(coded_frame)
         out = frame
 
-        # ✅ تنظيف مسبق ذكي: ضوضاء المستشعر بالمناطق المعتمه المسطحة فقط
         gray_pre = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY).astype(np.float32)
         lum_pre = cv2.blur(gray_pre, (9, 9))
-        dark_w = np.clip((85.0 - lum_pre) / 45.0, 0.0, 1.0)
+
+        # ✅✅✅ تنظيف كروما ذكي بالمعتم (أكبر مصدر للبلوكات)
+        dark_chroma = np.clip((95.0 - lum_pre) / 50.0, 0.0, 1.0)
+        if float(dark_chroma.mean()) > 0.03:
+            ycrcb = cv2.cvtColor(out, cv2.COLOR_BGR2YCrCb)
+            cr = cv2.blur(ycrcb[:, :, 1], (3, 3)).astype(np.float32)
+            cb = cv2.blur(ycrcb[:, :, 2], (3, 3)).astype(np.float32)
+            w2 = dark_chroma[:, :, None]
+            ycrcb[:, :, 1] = np.clip(cr * w2 + ycrcb[:, :, 1].astype(np.float32) * (1.0 - w2), 0, 255).astype(np.uint8)
+            ycrcb[:, :, 2] = np.clip(cb * w2 + ycrcb[:, :, 2].astype(np.float32) * (1.0 - w2), 0, 255).astype(np.uint8)
+            out = cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
+
+        # ✅ تنظيف لوما بالمعتم المسطح فقط
         tex_pre = np.abs(gray_pre - cv2.blur(gray_pre, (5, 5)))
-        flat_w = np.clip(1.0 - tex_pre / 10.0, 0.0, 1.0)
-        wmask = dark_w * flat_w
+        flat_w = np.clip(1.0 - tex_pre / 14.0, 0.0, 1.0)
+        wmask = dark_chroma * flat_w
         if float(wmask.mean()) > 0.02:
             den = cv2.medianBlur(out, 3)
             w3 = wmask[:, :, None]
             out = np.clip(out.astype(np.float32) * (1.0 - w3) + den.astype(np.float32) * w3,
                           0, 255).astype(np.uint8)
 
-        # ✅ شاربنتينج موحّد وآمن (الضوضاء تنظفت قبله)
+        # ✅ شاربنتينج متدرج حسب الإضاءة
+        global_lum = float(lum_pre.mean())
+        sh_amt = 1.06 + 0.18 * float(np.clip((global_lum - 60.0) / 80.0, 0.0, 1.0))
         blur_s = cv2.blur(out, (3, 3))
-        out = np.clip(out.astype(np.float32) * 1.22 - blur_s.astype(np.float32) * 0.22,
+        out = np.clip(out.astype(np.float32) * sh_amt - blur_s.astype(np.float32) * (sh_amt - 1.0),
                       0, 255).astype(np.uint8)
 
         t = frame_num / self.out_fps
@@ -1336,7 +1359,8 @@ async def start(c, m):
     await m.reply("👋 هلا! 🎬\n\nأرسل فيديو وأضيف الحقوق:\n\n"
                   "🖋 50 نص بتوزيع عشوائي منتظم\n"
                   "🖼 مصغرة = أول فريم\n"
-                  "🛡️ سموم بقوة كاملة تتكيّف مع الإضاءة بدون تشويه\n"
+                  "🌙 معالجة ذكية للمعتم (بدون بلوكات)\n"
+                  "🛡️ سموم بقوة كاملة ضد Dewatermark.ai\n"
                   "🖤 Telegram:@vamp1r3s أسود واضح\n"
                   "📺 عرض عمودي سليم | 🚀 سريع")
 
@@ -1364,7 +1388,7 @@ async def status(c, m):
 async def main():
     print("🤖 تشغيل البوت...")
     await app.start()
-    print("✓ البوت شغال | سموم بقوة كاملة + تنظيف ذكي للمعتم")
+    print("✓ البوت شغال | مضاد بلوكات المعتم + سموم بقوة كاملة")
     asyncio.create_task(worker())
     try:
         from pyrogram import idle
