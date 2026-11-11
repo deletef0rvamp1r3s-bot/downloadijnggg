@@ -53,7 +53,6 @@ STROKE_GAMMA = True
 TEXT_PARITY = True
 PARITY_AMP_TEXT = 2.5
 PARITY_BLOCK = 8
-# ✅✅✅ السموم بقوتها الكاملة (رجعنا القيم القوية)
 NYQ_AMP = (10.0, 16.0)
 BAYER_AMP = (12.0, 18.0)
 
@@ -537,7 +536,6 @@ class FloatingWatermark:
         frame[dy0:dy0 + (sy1 - sy0), dx0:dx0 + (sx1 - sx0)] = \
             np.clip(outp * 255.0, 0, 255).astype(np.uint8)
 
-    # ✅ قوة كاملة بكل الإضاءات — بدون أي تخفيف
     def _adaptive_bind(self, sprite, detail, edges, texture, x, y, gain, amod):
         if sprite is None or detail is None:
             return sprite
@@ -773,7 +771,6 @@ class FloatingWatermark:
         old = self.watermarks[idx].get("type", "strong")
         self.watermarks[idx] = self._make_watermark(old)
 
-    # ✅ سموم بقوة كاملة (رجعنا القيم القوية)
     def _apply_fast_poisons(self, spr, frame_num):
         if spr is None:
             return spr
@@ -806,7 +803,6 @@ class FloatingWatermark:
         spr[:, :, 3] = np.clip(alpha_int16, 0, 255).astype(np.uint8)
         return spr
 
-    # ✅ قوة كاملة بكل الإضاءات — بدون أي تخفيف
     def _apply_edge_camouflage(self, spr, edges, texture, x, y):
         if spr is None or edges is None:
             return spr
@@ -1010,14 +1006,16 @@ class FloatingWatermark:
         if self.vip["age"] < fade_f:
             alpha *= self.vip["age"] / fade_f
         mx, my = sw / 2 + 20, sh / 2 + 20
-        ax = max(0.0, self.width / 2 - mx); ay = max(0.0, self.height / 2 - my)
+        ax = max(0.0, self.width / 2 - mx)
+        ay = max(0.0, self.height / 2 - my)
         cx = self.width / 2 + ax * math.sin(t * self.vip["fx"] + self.vip["px"])
-        cy = self.height / 2 + ay * math.sin(t * self.vip["fy"] + self.vip["py])".replace(")", "")) if False else self.height / 2 + ay * math.sin(t * self.vip["fy"] + self.vip["py"])
+        cy = self.height / 2 + ay * math.sin(t * self.vip["fy"] + self.vip["py"])
         x = max(5, min(cx - sw / 2, self.width - sw - 5))
         y = max(5, min(cy - sh / 2, self.height - sh - 5))
         sprite, x, y = self._apply_text_effects(sprite, self.vip_fx, frame_num, sw, sh, x, y)
         sh, sw = sprite.shape[:2]
-        x = max(5, min(x, self.width - sw - 5)); y = max(5, min(y, self.height - sh - 5))
+        x = max(5, min(x, self.width - sw - 5))
+        y = max(5, min(y, self.height - sh - 5))
         sprite = self._adaptive_bind(sprite, self._frame_detail, self._frame_edges,
                                      self._frame_texture, x, y,
                                      self.vip_fx["bind_gain"], self.vip_fx["bind_amod"])
@@ -1068,8 +1066,7 @@ class FloatingWatermark:
         frame = self._to_display(coded_frame)
         out = frame
 
-        # ✅✅✅ التنظيف المسبق الذكي: ننظّف ضوضاء المستشعر بالمناطق المعتمه المسطحة فقط
-        # (السموم تبقى بقوة كاملة — نحن فقط نشيل الطين اللي كانت تشوه عليه)
+        # ✅ تنظيف مسبق ذكي: ضوضاء المستشعر بالمناطق المعتمه المسطحة فقط
         gray_pre = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY).astype(np.float32)
         lum_pre = cv2.blur(gray_pre, (9, 9))
         dark_w = np.clip((85.0 - lum_pre) / 45.0, 0.0, 1.0)
@@ -1082,7 +1079,7 @@ class FloatingWatermark:
             out = np.clip(out.astype(np.float32) * (1.0 - w3) + den.astype(np.float32) * w3,
                           0, 255).astype(np.uint8)
 
-        # ✅ شاربنتينج موحّد وآمن الآن (لأن الضوضاء تنظفت قبله)
+        # ✅ شاربنتينج موحّد وآمن (الضوضاء تنظفت قبله)
         blur_s = cv2.blur(out, (3, 3))
         out = np.clip(out.astype(np.float32) * 1.22 - blur_s.astype(np.float32) * 0.22,
                       0, 255).astype(np.uint8)
@@ -1126,7 +1123,8 @@ class FloatingWatermark:
             y = wm["y"] + math.cos(t * wm.get("fx_jy_freq", 0.06) + wm.get("fx_phase2", 0)) * wm.get("fx_jy_amp", 0.5)
             sprite, x, y = self._apply_text_effects(sprite, wm, frame_num, osw, osh, x, y)
             sh, sw = sprite.shape[:2]
-            x = max(2, min(x, self.width - sw - 2)); y = max(2, min(y, self.height - sh - 2))
+            x = max(2, min(x, self.width - sw - 2))
+            y = max(2, min(y, self.height - sh - 2))
             sprite = self._adaptive_bind(sprite, self._frame_detail, self._frame_edges,
                                          self._frame_texture, x, y, wm["bind_gain"], wm["bind_amod"])
             sprite = self._apply_edge_camouflage(sprite, self._frame_edges, self._frame_texture, x, y)
