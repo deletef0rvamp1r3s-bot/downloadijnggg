@@ -63,6 +63,12 @@ for f in Path(TEMP_DIR).glob("*.session*"):
         f.unlink()
     except Exception:
         pass
+# ✅ تنظيف أي مخلفات قديمة ضخمة من محاولات سابقة
+for f in Path("/tmp").glob("out_*.raw"):
+    try:
+        f.unlink()
+    except Exception:
+        pass
 
 
 def probe_video(path):
@@ -204,11 +210,15 @@ class PipeEncoder:
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
+    def alive(self):
+        return self.proc.poll() is None
+
     def write(self, frame):
         try:
             self.proc.stdin.write(frame.tobytes())
-        except BrokenPipeError:
-            pass
+            return True
+        except (BrokenPipeError, OSError):
+            return False
 
     def close(self):
         try:
@@ -235,21 +245,19 @@ class FloatingWatermark:
         self.step = 2 if self.fps >= 50 else 1
         self.out_fps = self.fps / self.step
 
-        self.raw_path = output_path + ".raw"
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-noautorotate",
-               "-i", video_path, "-vf", "format=bgr24",
-               "-f", "rawvideo", "-y", self.raw_path]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=TIME_HARD_SEC)
-        if r.returncode != 0 or not os.path.exists(self.raw_path):
-            raise ValueError(f"❌ فشل فك الفيديو: {r.stderr[-300:]}")
-        coded_bytes = g["w0"] * g["h0"] * 3
-        sz = os.path.getsize(self.raw_path)
-        if sz % coded_bytes != 0:
-            raise ValueError("❌ أبعاد الفك الخام ما تطابق الملف")
-        self.raw_f = open(self.raw_path, "rb")
-        first_buf = self.raw_f.read(coded_bytes)
-        self.raw_f.seek(0)
+        # ✅✅✅ فك عبر أنبوب مباشر — صفر ملفات خام على القرص (وداعاً لتعليق 92 دقيقة)
+        self.dec = subprocess.Popen(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-noautorotate",
+             "-i", video_path, "-vf", "format=bgr24", "-f", "rawvideo", "pipe:1"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.frame_bytes = g["w0"] * g["h0"] * 3
+        self.coded_w, self.coded_h = g["w0"], g["h0"]
+        first_buf = self._read_exact(self.frame_bytes)
+        if first_buf is None:
+            self._kill_dec()
+            raise ValueError("❌ ما قدرت أقرأ أول فريم من الأنبوب")
         coded0 = np.frombuffer(first_buf, dtype=np.uint8).reshape(g["h0"], g["w0"], 3)
+        self._first_pending = first_buf
 
         in_dims, in_sig = first_frame_sig(video_path)
         self.calib_sim = 0.0
@@ -277,23 +285,19 @@ class FloatingWatermark:
         self.rot_pick, self.calib_sim, dims = best[0], best[1], best[2]
         self.width, self.height = dims[0] + dims[0] % 2, dims[1] + dims[1] % 2
         self.in_png_dims = in_dims
-        self.frame_bytes = coded_bytes
-        self.coded_w, self.coded_h = g["w0"], g["h0"]
-        raw_total = sz // self.frame_bytes
+
+        raw_total = g["total"] if g["total"] > 0 else 0
         if raw_total <= 0:
-            raise ValueError("❌ ملف الفيديو الخام فاضي")
-        if g["total"] > 0:
-            raw_total = min(raw_total, g["total"] + 2)
+            raw_total = 10 ** 9  # غير معروف: نقرأ لين نهاية الأنبوب
         self.total_frames = raw_total
-        self.total_out = max(1, raw_total // self.step)
+        self.total_out = max(1, raw_total // self.step) if raw_total < 10 ** 9 else 0
 
         self.thumb_path = output_path + ".thumb.jpg"
         self._thumb_at = 1
         self._thumb_done = False
         print(f"✅ معايرة: rot={self.rot_pick} sim={self.calib_sim:.3f} | {self.width}x{self.height} | "
-              f"fps {self.fps:.0f}→{self.out_fps:.0f} | فريمات معالجة: {self.total_out}")
+              f"fps {self.fps:.0f}→{self.out_fps:.0f}")
 
-        # ✅ سقف بتريت أرفع مع bufsize أكبر = بدون اختناق بالمشاهد المعتمه
         br_m = self.src_bitrate / 1_000_000 if self.src_bitrate else 0
         cap_m = max(5.0, min(10.0, br_m * 2.5)) if br_m > 0 else 6.0
         self.maxrate = f"{cap_m:.0f}M"
@@ -353,22 +357,30 @@ class FloatingWatermark:
         self.ghosts = []
         self._init_ghosts()
 
+    def _read_exact(self, n):
+        buf = self.dec.stdout.read(n)
+        if buf is None or len(buf) < n:
+            return None
+        return buf
+
+    def _kill_dec(self):
+        try:
+            if self.dec.poll() is None:
+                self.dec.kill()
+        except Exception:
+            pass
+
     @property
     def strong_text(self):
         return self.text_variants[0]
 
     def close(self):
+        self._kill_dec()
         try:
-            if self.raw_f:
-                self.raw_f.close()
+            if os.path.exists(self.thumb_path):
+                os.remove(self.thumb_path)
         except Exception:
             pass
-        for p in (self.raw_path, self.thumb_path):
-            try:
-                if os.path.exists(p):
-                    os.remove(p)
-            except Exception:
-                pass
 
     def _to_display(self, f):
         if self.sar_stretch:
@@ -1051,7 +1063,6 @@ class FloatingWatermark:
         r[:, :, 3] = np.clip(r[:, :, 3].astype(np.float32) * fade * rst, 0, 255).astype(np.uint8)
         self._blend_sprite(frame, r, x, y + sh + gap, alpha)
 
-    # ✅✅✅ Parity متكيّف مع الإضاءة: بالمعتم يخف (ما ينشاف) وبالمضيء قوة كاملة
     def _apply_text_parity(self, frame, rects, frame_num):
         if not TEXT_PARITY or not rects:
             return frame
@@ -1079,7 +1090,6 @@ class FloatingWatermark:
         gray_pre = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY).astype(np.float32)
         lum_pre = cv2.blur(gray_pre, (9, 9))
 
-        # ✅✅✅ تنظيف كروما ذكي بالمعتم (أكبر مصدر للبلوكات)
         dark_chroma = np.clip((95.0 - lum_pre) / 50.0, 0.0, 1.0)
         if float(dark_chroma.mean()) > 0.03:
             ycrcb = cv2.cvtColor(out, cv2.COLOR_BGR2YCrCb)
@@ -1090,7 +1100,6 @@ class FloatingWatermark:
             ycrcb[:, :, 2] = np.clip(cb * w2 + ycrcb[:, :, 2].astype(np.float32) * (1.0 - w2), 0, 255).astype(np.uint8)
             out = cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
 
-        # ✅ تنظيف لوما بالمعتم المسطح فقط
         tex_pre = np.abs(gray_pre - cv2.blur(gray_pre, (5, 5)))
         flat_w = np.clip(1.0 - tex_pre / 14.0, 0.0, 1.0)
         wmask = dark_chroma * flat_w
@@ -1100,7 +1109,6 @@ class FloatingWatermark:
             out = np.clip(out.astype(np.float32) * (1.0 - w3) + den.astype(np.float32) * w3,
                           0, 255).astype(np.uint8)
 
-        # ✅ شاربنتينج متدرج حسب الإضاءة
         global_lum = float(lum_pre.mean())
         sh_amt = 1.06 + 0.18 * float(np.clip((global_lum - 60.0) / 80.0, 0.0, 1.0))
         blur_s = cv2.blur(out, (3, 3))
@@ -1186,10 +1194,15 @@ class FloatingWatermark:
         n = 0
         idx = 0
         t0 = time.time()
+        pending = getattr(self, "_first_pending", None)
         while True:
-            buf = self.raw_f.read(self.frame_bytes)
-            if len(buf) < self.frame_bytes:
-                break
+            if pending is not None:
+                buf = pending
+                pending = None
+            else:
+                buf = self._read_exact(self.frame_bytes)
+                if buf is None:
+                    break
             idx += 1
             if self.step > 1 and (idx % self.step) != 1:
                 continue
@@ -1207,16 +1220,17 @@ class FloatingWatermark:
                 except Exception:
                     pass
                 self._thumb_done = True
-            self.enc.write(done)
+            # ✅ إذا المرمّز مات لأي سبب (قرص/ذاكرة) → نفشل بسرعة بدل تعليق للأبد
+            if not self.enc.alive():
+                raise ValueError("❌ المرمّز توقف أثناء المعالجة (تحقق من مساحة القرص/الذاكرة)")
+            if not self.enc.write(done):
+                raise ValueError("❌ فشل إرسال الفريم للمرمّز")
             if progress_cb is not None and n % 20 == 0:
-                progress_cb(n, self.total_out)
+                progress_cb(n, max(n, self.total_out if self.total_out else n))
         if progress_cb is not None:
-            progress_cb(self.total_out, self.total_out)
+            progress_cb(max(n, 1), max(n, 1))
         self.enc.close()
-        try:
-            self.raw_f.close()
-        except Exception:
-            pass
+        self._kill_dec()
         return time.time() - t0
 
 
@@ -1285,7 +1299,7 @@ async def process_job(job):
         job["frames_done"] = 0
         job["t0"] = time.time()
         w = FloatingWatermark(inp, out, audio_src=inp)
-        job["frames_total"] = w.total_out
+        job["frames_total"] = w.total_out if w.total_out else 1
         job["dims"] = f"{w.width}x{w.height}"
 
         def cb(n, total):
@@ -1307,7 +1321,7 @@ async def process_job(job):
             await msg.edit_text(f"❌ الحجم {sz:.1f}MB أكبر من 500MB")
             return
         job["stage"] = "upload"
-        dur_sec = int(round(w.total_out / w.out_fps)) if w.out_fps > 0 else 0
+        dur_sec = int(round(w.total_out / w.out_fps)) if (w.out_fps > 0 and w.total_out) else 0
         thumb_arg = w.thumb_path if os.path.exists(w.thumb_path) else None
         await message.reply_video(
             out,
@@ -1362,7 +1376,7 @@ async def start(c, m):
                   "🌙 معالجة ذكية للمعتم (بدون بلوكات)\n"
                   "🛡️ سموم بقوة كاملة ضد Dewatermark.ai\n"
                   "🖤 Telegram:@vamp1r3s أسود واضح\n"
-                  "📺 عرض عمودي سليم | 🚀 سريع")
+                  "📺 عرض عمودي سليم | 🚀 سريع | 💾 بدون ملفات وسيطة")
 
 
 @app.on_message(filters.video)
@@ -1388,7 +1402,7 @@ async def status(c, m):
 async def main():
     print("🤖 تشغيل البوت...")
     await app.start()
-    print("✓ البوت شغال | مضاد بلوكات المعتم + سموم بقوة كاملة")
+    print("✓ البوت شغال | فك عبر أنبوب (صفر قرص) + كاشف موت المرمّز")
     asyncio.create_task(worker())
     try:
         from pyrogram import idle
