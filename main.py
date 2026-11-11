@@ -32,7 +32,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise ValueError("⚠️ عبّئ المتغيرات في Railway: API_ID, API_HASH, BOT_TOKEN")
 
-ENCODE_CRF = 20
+ENCODE_CRF = 18
 ENCODE_PRESET = "superfast"
 TIME_HARD_SEC = 29 * 60
 
@@ -53,8 +53,9 @@ STROKE_GAMMA = True
 TEXT_PARITY = True
 PARITY_AMP_TEXT = 2.5
 PARITY_BLOCK = 8
-NYQ_AMP = (5.0, 9.0)
-BAYER_AMP = (6.0, 11.0)
+# ✅✅✅ السموم بقوتها الكاملة (رجعنا القيم القوية)
+NYQ_AMP = (10.0, 16.0)
+BAYER_AMP = (12.0, 18.0)
 
 PROGRESS_INTERVAL = 2.0
 
@@ -230,7 +231,6 @@ class FloatingWatermark:
         self.fps = g["fps"] if g["fps"] > 0 else 30.0
         self.src_bitrate = g["bitrate"]
 
-        # ✅ بوت التجميع يضاعف الفريمات لـ60fps (توائم مكررة) → نعالج نصفها فقط
         self.step = 2 if self.fps >= 50 else 1
         self.out_fps = self.fps / self.step
 
@@ -286,7 +286,6 @@ class FloatingWatermark:
         self.total_frames = raw_total
         self.total_out = max(1, raw_total // self.step)
 
-        # ✅✅ المصغرة = أول فريم بالضبط
         self.thumb_path = output_path + ".thumb.jpg"
         self._thumb_at = 1
         self._thumb_done = False
@@ -294,7 +293,7 @@ class FloatingWatermark:
               f"fps {self.fps:.0f}→{self.out_fps:.0f} | فريمات معالجة: {self.total_out}")
 
         br_m = self.src_bitrate / 1_000_000 if self.src_bitrate else 0
-        cap_m = max(3.0, min(6.0, br_m * 2.0)) if br_m > 0 else 4.0
+        cap_m = max(3.0, min(8.0, br_m * 2.0)) if br_m > 0 else 5.0
         self.maxrate = f"{cap_m:.0f}M"
         self.enc = PipeEncoder(self.width, self.height, self.out_fps, output_path,
                                audio_src, ENCODE_CRF, ENCODE_PRESET, self.maxrate)
@@ -538,6 +537,7 @@ class FloatingWatermark:
         frame[dy0:dy0 + (sy1 - sy0), dx0:dx0 + (sx1 - sx0)] = \
             np.clip(outp * 255.0, 0, 255).astype(np.uint8)
 
+    # ✅ قوة كاملة بكل الإضاءات — بدون أي تخفيف
     def _adaptive_bind(self, sprite, detail, edges, texture, x, y, gain, amod):
         if sprite is None or detail is None:
             return sprite
@@ -687,8 +687,8 @@ class FloatingWatermark:
         prof = random.random()
         if anchor:
             op_mid, op_amp = random.uniform(0.55, 0.68), random.uniform(0.04, 0.08)
-            fx_nyq = random.uniform(8.0, 14.0)
-            fx_bayer = random.uniform(10.0, 16.0)
+            fx_nyq = random.uniform(12.0, 18.0)
+            fx_bayer = random.uniform(14.0, 20.0)
             fx_echo = random.uniform(0.55, 0.75)
             bind_gain = random.uniform(7.5, 10.0)
             bind_amod = random.uniform(0.48, 0.68)
@@ -699,8 +699,8 @@ class FloatingWatermark:
         elif prof < 0.60:
             op_mid, op_amp = 0.65, 0.0
             is_opaque = True
-            fx_nyq = random.uniform(7.0, 13.0)
-            fx_bayer = random.uniform(9.0, 15.0)
+            fx_nyq = random.uniform(11.0, 17.0)
+            fx_bayer = random.uniform(13.0, 19.0)
             fx_echo = random.uniform(0.50, 0.65)
             bind_gain = random.uniform(6.5, 8.5)
             bind_amod = random.uniform(0.42, 0.58)
@@ -708,8 +708,8 @@ class FloatingWatermark:
             pz_gam_amp = random.uniform(0.12, 0.18)
         else:
             op_mid, op_amp = random.uniform(0.32, 0.58), random.uniform(0.08, 0.16)
-            fx_nyq = random.uniform(8.0, 14.0)
-            fx_bayer = random.uniform(10.0, 16.0)
+            fx_nyq = random.uniform(12.0, 18.0)
+            fx_bayer = random.uniform(14.0, 20.0)
             fx_echo = random.uniform(0.55, 0.75)
             bind_gain = random.uniform(7.5, 10.0)
             bind_amod = random.uniform(0.48, 0.68)
@@ -773,6 +773,7 @@ class FloatingWatermark:
         old = self.watermarks[idx].get("type", "strong")
         self.watermarks[idx] = self._make_watermark(old)
 
+    # ✅ سموم بقوة كاملة (رجعنا القيم القوية)
     def _apply_fast_poisons(self, spr, frame_num):
         if spr is None:
             return spr
@@ -784,7 +785,7 @@ class FloatingWatermark:
         np.random.seed((frame_num * 7919) % (2**32))
         spr[:, 1:, 2] = spr[:, :-1, 2]
         spr[:, :-1, 0] = spr[:, 1:, 0]
-        noise = np.random.randint(-2, 3, size=(H, W, 3), dtype=np.int16)
+        noise = np.random.randint(-3, 4, size=(H, W, 3), dtype=np.int16)
         mask3 = np.stack([mask]*3, axis=-1)
         spr_int16 = spr[:, :, :3].astype(np.int16)
         spr_int16 += (noise * mask3)
@@ -794,17 +795,18 @@ class FloatingWatermark:
         edge_mask = cv2.dilate(a8, k_edge, iterations=1) - cv2.erode(a8, k_edge, iterations=1)
         edge_mask = (edge_mask > 10) & mask
         if edge_mask.any():
-            edge_noise = np.random.randint(-2, 3, size=(H, W, 3), dtype=np.int16)
+            edge_noise = np.random.randint(-4, 5, size=(H, W, 3), dtype=np.int16)
             edge_mask3 = np.stack([edge_mask]*3, axis=-1)
             spr_int16 = spr[:, :, :3].astype(np.int16)
             spr_int16 += (edge_noise * edge_mask3)
             spr[:, :, :3] = np.clip(spr_int16, 0, 255).astype(np.uint8)
         alpha_int16 = alpha.astype(np.int16)
-        alpha_edge_noise = np.random.randint(-2, 3, size=(H, W), dtype=np.int16)
+        alpha_edge_noise = np.random.randint(-4, 5, size=(H, W), dtype=np.int16)
         alpha_int16 += (alpha_edge_noise * edge_mask)
         spr[:, :, 3] = np.clip(alpha_int16, 0, 255).astype(np.uint8)
         return spr
 
+    # ✅ قوة كاملة بكل الإضاءات — بدون أي تخفيف
     def _apply_edge_camouflage(self, spr, edges, texture, x, y):
         if spr is None or edges is None:
             return spr
@@ -962,7 +964,7 @@ class FloatingWatermark:
             "fx_phase": random.uniform(0, math.pi * 2), "fx_phase2": random.uniform(0, math.pi * 2),
             "fx_breathe_freq": random.uniform(0.6, 1.0), "fx_breathe_amp": random.uniform(0.02, 0.03),
             "fx_erode_freq": random.uniform(0.08, 0.15),
-            "fx_nyq": random.uniform(6.0, 10.0), "fx_bayer": random.uniform(8.0, 12.0),
+            "fx_nyq": random.uniform(8.0, 12.0), "fx_bayer": random.uniform(10.0, 14.0),
             "fx_echo": random.uniform(0.30, 0.40), "fx_refl": random.uniform(30.0, 40.0),
             "bind_gain": 3.5, "bind_amod": 0.25,
             "fx_grad_dir": random.choice([0, 1, 2]), "fx_grad_strength": random.uniform(0.20, 0.40),
@@ -1010,7 +1012,7 @@ class FloatingWatermark:
         mx, my = sw / 2 + 20, sh / 2 + 20
         ax = max(0.0, self.width / 2 - mx); ay = max(0.0, self.height / 2 - my)
         cx = self.width / 2 + ax * math.sin(t * self.vip["fx"] + self.vip["px"])
-        cy = self.height / 2 + ay * math.sin(t * self.vip["fy"] + self.vip["py"])
+        cy = self.height / 2 + ay * math.sin(t * self.vip["fy"] + self.vip["py])".replace(")", "")) if False else self.height / 2 + ay * math.sin(t * self.vip["fy"] + self.vip["py"])
         x = max(5, min(cx - sw / 2, self.width - sw - 5))
         y = max(5, min(cy - sh / 2, self.height - sh - 5))
         sprite, x, y = self._apply_text_effects(sprite, self.vip_fx, frame_num, sw, sh, x, y)
@@ -1065,9 +1067,26 @@ class FloatingWatermark:
     def process_frame(self, coded_frame, frame_num):
         frame = self._to_display(coded_frame)
         out = frame
+
+        # ✅✅✅ التنظيف المسبق الذكي: ننظّف ضوضاء المستشعر بالمناطق المعتمه المسطحة فقط
+        # (السموم تبقى بقوة كاملة — نحن فقط نشيل الطين اللي كانت تشوه عليه)
+        gray_pre = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        lum_pre = cv2.blur(gray_pre, (9, 9))
+        dark_w = np.clip((85.0 - lum_pre) / 45.0, 0.0, 1.0)
+        tex_pre = np.abs(gray_pre - cv2.blur(gray_pre, (5, 5)))
+        flat_w = np.clip(1.0 - tex_pre / 10.0, 0.0, 1.0)
+        wmask = dark_w * flat_w
+        if float(wmask.mean()) > 0.02:
+            den = cv2.medianBlur(out, 3)
+            w3 = wmask[:, :, None]
+            out = np.clip(out.astype(np.float32) * (1.0 - w3) + den.astype(np.float32) * w3,
+                          0, 255).astype(np.uint8)
+
+        # ✅ شاربنتينج موحّد وآمن الآن (لأن الضوضاء تنظفت قبله)
         blur_s = cv2.blur(out, (3, 3))
-        out = np.clip(out.astype(np.float32) * 1.30 - blur_s.astype(np.float32) * 0.30,
+        out = np.clip(out.astype(np.float32) * 1.22 - blur_s.astype(np.float32) * 0.22,
                       0, 255).astype(np.uint8)
+
         t = frame_num / self.out_fps
         if self._frame_detail is None or (frame_num - self._maps_frame) >= 4:
             gray = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
@@ -1156,7 +1175,6 @@ class FloatingWatermark:
             frame = np.frombuffer(buf, dtype=np.uint8).reshape(self.coded_h, self.coded_w, 3)
             n += 1
             done = self.process_frame(frame, n)
-            # ✅ المصغرة تُلتقط من أول فريم معالَج (n=1)
             if not self._thumb_done and n >= self._thumb_at:
                 try:
                     th = done
@@ -1174,7 +1192,6 @@ class FloatingWatermark:
         if progress_cb is not None:
             progress_cb(self.total_out, self.total_out)
         self.enc.close()
-        # ✅ لا نحذف المصغرة هنا — تحذف بعد الإرسال بـ close()
         try:
             self.raw_f.close()
         except Exception:
@@ -1320,10 +1337,10 @@ async def worker():
 async def start(c, m):
     await m.reply("👋 هلا! 🎬\n\nأرسل فيديو وأضيف الحقوق:\n\n"
                   "🖋 50 نص بتوزيع عشوائي منتظم\n"
-                  "🖼 مصغرة = أول فريم من المقطع\n"
-                  "🛡️ سموم ذكية ضد Dewatermark.ai\n"
+                  "🖼 مصغرة = أول فريم\n"
+                  "🛡️ سموم بقوة كاملة تتكيّف مع الإضاءة بدون تشويه\n"
                   "🖤 Telegram:@vamp1r3s أسود واضح\n"
-                  "📺 عرض عمودي سليم | 🚀 سريع | 💾 حجم معقول")
+                  "📺 عرض عمودي سليم | 🚀 سريع")
 
 
 @app.on_message(filters.video)
@@ -1349,7 +1366,7 @@ async def status(c, m):
 async def main():
     print("🤖 تشغيل البوت...")
     await app.start()
-    print("✓ البوت شغال | مصغرة من أول فريم + 50 نص + سرعة مضاعفة")
+    print("✓ البوت شغال | سموم بقوة كاملة + تنظيف ذكي للمعتم")
     asyncio.create_task(worker())
     try:
         from pyrogram import idle
