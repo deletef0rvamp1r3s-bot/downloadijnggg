@@ -32,7 +32,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise ValueError("⚠️ عبّئ المتغيرات في Railway: API_ID, API_HASH, BOT_TOKEN")
 
-ENCODE_CRF = 18
+ENCODE_CRF = 20          # ✅ CRF 20 مثل طلبك
 ENCODE_PRESET = "superfast"
 TIME_HARD_SEC = 29 * 60
 
@@ -193,7 +193,7 @@ class PipeEncoder:
                 "-g", str(max(30, int(fps * 2))),
                 "-keyint_min", str(max(15, int(fps))),
                 "-sc_threshold", "0",
-                "-x264-params", "aq-mode=3:aq-strength=1.0:ref=2:me=dia:subme=2:trellis=0:threads=0"]
+                "-x264-params", "aq-mode=3:aq-strength=0.9:ref=2:me=dia:subme=2:trellis=0:threads=0"]
         if maxrate:
             cmd += ["-maxrate", maxrate]
         if bufsize:
@@ -239,7 +239,6 @@ class FloatingWatermark:
         self.step = 2 if self.fps >= 50 else 1
         self.out_fps = self.fps / self.step
 
-        # ✅ فك عبر أنبوب مباشر — صفر ملفات خام على القرص
         self.dec = subprocess.Popen(
             ["ffmpeg", "-hide_banner", "-loglevel", "error", "-noautorotate",
              "-i", video_path, "-vf", "format=bgr24", "-f", "rawvideo", "pipe:1"],
@@ -292,10 +291,11 @@ class FloatingWatermark:
         print(f"✅ معايرة: rot={self.rot_pick} sim={self.calib_sim:.3f} | {self.width}x{self.height} | "
               f"fps {self.fps:.0f}→{self.out_fps:.0f}")
 
+        # ✅✅✅ السقف مربوط بمصدرك: 2.2× بتريت المصدر (أرضية 2.5M بدل 5M) = بدون انفجار
         br_m = self.src_bitrate / 1_000_000 if self.src_bitrate else 0
-        cap_m = max(5.0, min(10.0, br_m * 2.5)) if br_m > 0 else 6.0
-        self.maxrate = f"{cap_m:.0f}M"
-        self.bufsize = f"{int(cap_m * 2.5)}M"
+        cap_m = max(2.5, min(8.0, br_m * 2.2)) if br_m > 0 else 4.0
+        self.maxrate = f"{cap_m:.1f}M"
+        self.bufsize = f"{max(4, int(cap_m * 2.5))}M"
         self.enc = PipeEncoder(self.width, self.height, self.out_fps, output_path,
                                audio_src, ENCODE_CRF, ENCODE_PRESET,
                                self.maxrate, self.bufsize)
@@ -782,7 +782,6 @@ class FloatingWatermark:
         old = self.watermarks[idx].get("type", "strong")
         self.watermarks[idx] = self._make_watermark(old)
 
-    # ✅✅✅ سموم خفية: شكل وكثافة فقط — صفر ضوضاء سطوع (ما توصخ بالمعتم أبداً)
     def _apply_fast_poisons(self, spr, frame_num):
         if spr is None:
             return spr
@@ -792,13 +791,11 @@ class FloatingWatermark:
             return spr
         H, W = spr.shape[:2]
         rng = np.random.RandomState((frame_num * 7919) % (2**32))
-        # 1) اهتزاز شكل تحت-بكسلي لكل فريم (يكسر التتبع الزمني بدون أي رقطة سطوع)
         dx = rng.uniform(-0.35, 0.35)
         dy = rng.uniform(-0.35, 0.35)
         M = np.float32([[1, 0, dx], [0, 1, dy]])
         spr = cv2.warpAffine(spr, M, (W, H), flags=cv2.INTER_LINEAR,
                              borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
-        # 2) ضوضاء على حواف الـ Alpha فقط (الشكل يتغير، السطوع ما يتغير)
         a8 = spr[:, :, 3]
         k = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
         er = cv2.erode(a8, k, 1).astype(np.float32)
@@ -811,7 +808,6 @@ class FloatingWatermark:
             spr[:, :, 3] = af.astype(np.uint8)
         return spr
 
-    # ✅✅✅ Parity داخل الحرف فقط — الخلفية ما تلمس أبداً
     def _apply_parity_sprite(self, spr, gx, gy, sgn):
         if spr is None or not TEXT_PARITY:
             return spr
@@ -915,15 +911,12 @@ class FloatingWatermark:
             ii, jj = np.ogrid[0:H_spr, 0:W_spr]
             chk = (((ii + jj) & 1).astype(np.float32) * 2.0 - 1.0)
 
-        # ✅✅✅ Nyquist كسم كثافة Alpha (مو سطوع) = خفي بالمعتم والمضيء
         nyq_f = wm.get("fx_nyq", 10.0) / 255.0
         alpha = alpha * (1.0 + chk * nyq_f * wm.get("pz_nyq_sign", 1.0) * mask)
 
-        # ✅ تدرج وانعكاس ناعمين (يبقون RGB لأنها موجات ناعمة مو رقط)
         g25, rfl, gradv = self._get_grad_refl(H_spr, W_spr)
         rgb += (g25 + rfl * wm.get("fx_refl", 36.0))[:, :, None] * mask[:, :, None]
 
-        # ✅✅✅ Bayer كسم كثافة Alpha على حواف الحرف فقط
         if band.any():
             bay_f = wm.get("fx_bayer", 12.0) / 255.0
             if use_big:
@@ -1081,9 +1074,9 @@ class FloatingWatermark:
     def process_frame(self, coded_frame, frame_num):
         frame = self._to_display(coded_frame)
         out = frame
-        # ✅ شاربنتينج موحّد بسيط (مثل كودك الأصلي) — بدون تكييفات اليوم
+        # ✅ شاربنتينج ألطف (1.18) = وضوح بدون تضخيم ضوضاء يكلف بتريت
         blur_s = cv2.blur(out, (3, 3))
-        out = np.clip(out.astype(np.float32) * 1.30 - blur_s.astype(np.float32) * 0.30,
+        out = np.clip(out.astype(np.float32) * 1.18 - blur_s.astype(np.float32) * 0.18,
                       0, 255).astype(np.uint8)
         t = frame_num / self.out_fps
         if self._frame_detail is None or (frame_num - self._maps_frame) >= 4:
@@ -1129,7 +1122,6 @@ class FloatingWatermark:
             sprite = self._adaptive_bind(sprite, self._frame_detail, self._frame_edges,
                                          self._frame_texture, x, y, wm["bind_gain"], wm["bind_amod"])
             sprite = self._apply_edge_camouflage(sprite, self._frame_edges, self._frame_texture, x, y)
-            # ✅ Parity داخل الحرف فقط
             sgn = 1.0 if (idx % 2 == 0) else -1.0
             sprite = self._apply_parity_sprite(sprite, int(x), int(y), sgn)
             if wm.get("anchor"):
@@ -1345,8 +1337,9 @@ async def start(c, m):
     await m.reply("👋 هلا! 🎬\n\nأرسل فيديو وأضيف الحقوق:\n\n"
                   "🖋 50 نص بتوزيع عشوائي منتظم\n"
                   "🖼 مصغرة = أول فريم\n"
-                  "🛡️ سموم خفية بقوة كاملة (ما تبان بمعتم ولا مضيء)\n"
+                  "🛡️ سموم خفية بقوة كاملة\n"
                   "🖤 Telegram:@vamp1r3s أسود واضح\n"
+                  "💾 حجم مضبوط على مصدر مقطعك\n"
                   "📺 عرض عمودي سليم | 🚀 سريع")
 
 
@@ -1373,7 +1366,7 @@ async def status(c, m):
 async def main():
     print("🤖 تشغيل البوت...")
     await app.start()
-    print("✓ البوت شغال | سموم خفية بنطاق Alpha/الشكل = نظيفة بالمعتم والمضيء")
+    print("✓ البوت شغال | CRF 20 + سقف بتريت مربوط بالمصدر = بدون انفجار حجم")
     asyncio.create_task(worker())
     try:
         from pyrogram import idle
