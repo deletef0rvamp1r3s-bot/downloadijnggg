@@ -32,7 +32,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise ValueError("⚠️ عبّئ المتغيرات في Railway: API_ID, API_HASH, BOT_TOKEN")
 
-ENCODE_CRF = 20          # ✅ CRF 20 مثل طلبك
+ENCODE_CRF = 20
 ENCODE_PRESET = "superfast"
 TIME_HARD_SEC = 29 * 60
 
@@ -291,7 +291,6 @@ class FloatingWatermark:
         print(f"✅ معايرة: rot={self.rot_pick} sim={self.calib_sim:.3f} | {self.width}x{self.height} | "
               f"fps {self.fps:.0f}→{self.out_fps:.0f}")
 
-        # ✅✅✅ السقف مربوط بمصدرك: 2.2× بتريت المصدر (أرضية 2.5M بدل 5M) = بدون انفجار
         br_m = self.src_bitrate / 1_000_000 if self.src_bitrate else 0
         cap_m = max(2.5, min(8.0, br_m * 2.2)) if br_m > 0 else 4.0
         self.maxrate = f"{cap_m:.1f}M"
@@ -782,6 +781,7 @@ class FloatingWatermark:
         old = self.watermarks[idx].get("type", "strong")
         self.watermarks[idx] = self._make_watermark(old)
 
+    # ✅ سموم السبرايت: شكل + حواف مقنعة (ضوضاء الحواف خفية لأن الحواف انتقالات متوقعة)
     def _apply_fast_poisons(self, spr, frame_num):
         if spr is None:
             return spr
@@ -791,8 +791,9 @@ class FloatingWatermark:
             return spr
         H, W = spr.shape[:2]
         rng = np.random.RandomState((frame_num * 7919) % (2**32))
-        dx = rng.uniform(-0.35, 0.35)
-        dy = rng.uniform(-0.35, 0.35)
+        # اهتزاز تحت-بكسلي أقوى (كسر التتبع الزمني)
+        dx = rng.uniform(-0.8, 0.8)
+        dy = rng.uniform(-0.8, 0.8)
         M = np.float32([[1, 0, dx], [0, 1, dy]])
         spr = cv2.warpAffine(spr, M, (W, H), flags=cv2.INTER_LINEAR,
                              borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
@@ -806,6 +807,12 @@ class FloatingWatermark:
             af = spr[:, :, 3].astype(np.float32)
             af = np.where(band, np.clip(af + edge_noise * 0.5, 0, 255), af)
             spr[:, :, 3] = af.astype(np.uint8)
+            # ✅ ضوضاء سطوع على حواف الحرف فقط (مقنعة بالحواف = خفية + تكسر الـ matting)
+            edge_lum = rng.uniform(-5.0, 5.0, size=(H, W, 3)).astype(np.float32)
+            band3 = band[:, :, None]
+            rgbf = spr[:, :, :3].astype(np.float32)
+            rgbf = np.where(band3, np.clip(rgbf + edge_lum * band3, 0, 255), rgbf)
+            spr[:, :, :3] = rgbf.astype(np.uint8)
         return spr
 
     def _apply_parity_sprite(self, spr, gx, gy, sgn):
@@ -1071,10 +1078,40 @@ class FloatingWatermark:
         r[:, :, 3] = np.clip(r[:, :, 3].astype(np.float32) * fade * rst, 0, 255).astype(np.uint8)
         self._blend_sprite(frame, r, x, y + sh + gap, alpha)
 
+    # ✅✅✅ سموم المناطق الخفية: كروما-Parity كاملة + ضوضاء سطوع مقنعة بالتكستشر فقط
+    def _apply_region_poisons(self, frame, rects, frame_num):
+        if not rects:
+            return frame
+        H, W = frame.shape[:2]
+        rng = np.random.RandomState((frame_num * 104729) % (2**32))
+        tex = self._frame_texture
+        for i, (rx, ry, rw, rh) in enumerate(rects):
+            x0, y0 = max(0, rx - 6), max(0, ry - 6)
+            x1, y1 = min(W, rx + rw + 6), min(H, ry + rh + 6)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            rh2, rw2 = y1 - y0, x1 - x0
+            region = frame[y0:y1, x0:x1].astype(np.float32)
+            # 1) Parity كروما (ألوان فقط) = خفي تماماً للعين، يكسر اتساق الألوان عند الإزالة
+            sgn = 1.0 if (i % 2 == 0) else -1.0
+            sub = self._parity1[y0:y1, x0:x1]
+            chroma = sub * (PARITY_AMP_TEXT * 2.2) * sgn
+            region[:, :, 0] = np.clip(region[:, :, 0] + chroma * 0.7, 0, 255)   # B
+            region[:, :, 2] = np.clip(region[:, :, 2] - chroma * 0.7, 0, 255)   # R
+            # 2) ضوضاء سطوع مقنعة بالتكستشر (صفر على المسطح/المعتم، كاملة على التفاصيل)
+            if tex is not None:
+                tmask = np.clip(tex[y0:y1, x0:x1] / 16.0, 0.0, 1.0)
+            else:
+                tmask = np.ones((rh2, rw2), dtype=np.float32)
+            noise = rng.uniform(-4.0, 4.0, size=(rh2, rw2)).astype(np.float32)
+            add = (noise * tmask)[:, :, None]
+            region = np.clip(region + add, 0, 255)
+            frame[y0:y1, x0:x1] = region.astype(np.uint8)
+        return frame
+
     def process_frame(self, coded_frame, frame_num):
         frame = self._to_display(coded_frame)
         out = frame
-        # ✅ شاربنتينج ألطف (1.18) = وضوح بدون تضخيم ضوضاء يكلف بتريت
         blur_s = cv2.blur(out, (3, 3))
         out = np.clip(out.astype(np.float32) * 1.18 - blur_s.astype(np.float32) * 0.18,
                       0, 255).astype(np.uint8)
@@ -1087,6 +1124,8 @@ class FloatingWatermark:
             blur_large = cv2.GaussianBlur(gray, (15, 15), 0).astype(np.float32)
             self._frame_texture = np.abs(blur_small - blur_large)
             self._maps_frame = frame_num
+        # ✅ وميض alpha عشوائي لكل فريم (كسر التوحيد الزمني للإزالة) — ±6% غير محسوس
+        rng_af = np.random.RandomState((frame_num * 65537) % (2**32))
         rects = []
         for idx, wm in enumerate(self.watermarks):
             wm["y"] -= wm["vy_ps"] / self.out_fps
@@ -1105,6 +1144,7 @@ class FloatingWatermark:
                 wave = math.sin(2 * math.pi * t / wm["op_period"] + wm["op_phase"])
                 alpha = fade * (wm["op_mid"] + wm["op_amp"] * wave)
             alpha = max(0.28, min(0.68, alpha))
+            alpha *= 1.0 + rng_af.uniform(-0.06, 0.06)
             if wm["y"] < self.top_fade_margin:
                 fade_top = max(0.0, wm["y"] / self.top_fade_margin)
                 alpha *= fade_top
@@ -1153,6 +1193,7 @@ class FloatingWatermark:
                 continue
             self._blend_sprite(out, sprite, g["x"], g["y"], ga)
             rects.append((int(g["x"]), int(g["y"]), sprite.shape[1], sh))
+        out = self._apply_region_poisons(out, rects, frame_num)
         return out
 
     def run(self, progress_cb=None, job=None):
@@ -1337,10 +1378,9 @@ async def start(c, m):
     await m.reply("👋 هلا! 🎬\n\nأرسل فيديو وأضيف الحقوق:\n\n"
                   "🖋 50 نص بتوزيع عشوائي منتظم\n"
                   "🖼 مصغرة = أول فريم\n"
-                  "🛡️ سموم خفية بقوة كاملة\n"
+                  "🛡️ سموم خفية بقوة النسخة القديمة (كروما+تكستشر+زمن)\n"
                   "🖤 Telegram:@vamp1r3s أسود واضح\n"
-                  "💾 حجم مضبوط على مصدر مقطعك\n"
-                  "📺 عرض عمودي سليم | 🚀 سريع")
+                  "💾 حجم مضبوط | 📺 عرض سليم | 🚀 سريع")
 
 
 @app.on_message(filters.video)
@@ -1366,7 +1406,7 @@ async def status(c, m):
 async def main():
     print("🤖 تشغيل البوت...")
     await app.start()
-    print("✓ البوت شغال | CRF 20 + سقف بتريت مربوط بالمصدر = بدون انفجار حجم")
+    print("✓ البوت شغال | سموم خفية بقوة كاملة: كروما+تكستشر+حواف+زمن")
     asyncio.create_task(worker())
     try:
         from pyrogram import idle
