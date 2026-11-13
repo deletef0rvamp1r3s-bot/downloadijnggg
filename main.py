@@ -37,8 +37,8 @@ ENCODE_PRESET = "superfast"
 TIME_HARD_SEC = 29 * 60
 
 STRONG_COUNT = 50
-FLICK_COUNT = 3
-GHOST_COUNT = 2
+FLICK_COUNT = 0   # ✅ انحذفت (كانت ومضات مزعجة)
+GHOST_COUNT = 0   # ✅ انحذفت (كانت لطخات متحركة)
 MAX_QUEUE = 6
 
 HALO_STRENGTH = 0.20
@@ -289,7 +289,6 @@ class FloatingWatermark:
         self._thumb_at = 1
         self._thumb_done = False
 
-        # ✅✅✅ Spread-Spectrum chroma field: ملكية_forensic مدمجة ببصمة الحساب
         self.vip_text_seed = 0
         for ch in "Telegram:@vamp1r3s":
             self.vip_text_seed = (self.vip_text_seed * 31 + ord(ch)) % (2**31)
@@ -307,7 +306,7 @@ class FloatingWatermark:
         field = field / (np.std(field) + 1e-6) * 1.8
         self._ss_field = field
         print(f"✅ معايرة: rot={self.rot_pick} sim={self.calib_sim:.3f} | {self.width}x{self.height} | "
-              f"fps {self.fps:.0f}→{self.out_fps:.0f} | SS-field جاهز")
+              f"fps {self.fps:.0f}→{self.out_fps:.0f}")
 
         br_m = self.src_bitrate / 1_000_000 if self.src_bitrate else 0
         cap_m = max(2.5, min(8.0, br_m * 2.2)) if br_m > 0 else 4.0
@@ -523,7 +522,7 @@ class FloatingWatermark:
         halo = np.zeros((H + 2 * m, W + 2 * m, 4), dtype=np.uint8)
         halo[:, :, 0] = hc; halo[:, :, 1] = hc; halo[:, :, 2] = hc
         halo[:, :, 3] = np.clip(canvas * hs, 0, 255).astype(np.uint8)
-        if len(self._halo_cache) > 60:
+        if len(self._halo_cache) > 120:
             self._halo_cache.clear()
         self._halo_cache[key] = (halo, m)
         return halo, m
@@ -689,19 +688,11 @@ class FloatingWatermark:
             font_size = random.randint(self.strong_max_font, max(self.strong_max_font + 2, int(self.strong_max_font * 1.5)))
         else:
             font_size = random.randint(self.strong_min_font, self.strong_max_font)
-        if wm_type == "flick":
-            base_alpha = random.uniform(0.38, 0.42)
-            vy_ps = random.uniform(220, 360)
-            life_s = random.uniform(4.0, 7.0)
-            flick_hz = random.uniform(0.7, 1.4)
-            j_amp = random.uniform(0.3, 0.5)
-            anchor = False
-        else:
-            base_alpha = 1.0
-            vy_ps = random.uniform(120, 260)
-            life_s = random.uniform(4.5, 8.0)
-            flick_hz = 0.0
-            j_amp = random.uniform(0.25, 0.45)
+        base_alpha = 1.0
+        vy_ps = random.uniform(120, 260)
+        life_s = random.uniform(4.5, 8.0)
+        flick_hz = 0.0
+        j_amp = random.uniform(0.25, 0.45)
 
         fx_nyq = random.uniform(*NYQ_AMP)
         fx_bayer = random.uniform(*BAYER_AMP)
@@ -752,22 +743,17 @@ class FloatingWatermark:
         fo = max(10, int(1.3 * self.out_fps))
         x, y = self._spawn_position(font_size, prefer_detail=prefer_detail)
 
-        # ✅✅✅ نسخ صدى باهتة (IMPRINTS): تبقى كأشباح بعد أي محاولة إزالة
-        e1 = (random.uniform(-18, 18), random.uniform(-14, 14), random.uniform(0.14, 0.18))
-        e2 = (random.uniform(-26, 26), random.uniform(-20, 20), random.uniform(0.09, 0.13))
-
         return {
             "type": wm_type, "blend": blend, "anchor": anchor,
             "text_idx": 0,
             "vary_seed": random.randint(1, 10**9),
             "x": x, "y": y, "vy_ps": vy_ps, "vx_ps": 0.0,
-            "e1": e1, "e2": e2,
             "fx_tilt": math.radians(random.uniform(-3, 3)),
             "fx_grow_amp": random.uniform(0.06, 0.14),
             "font_size": font_size, "base_alpha": base_alpha,
             "life": life, "age": random.randint(0, fi), "fade_in": fi, "fade_out": fo,
             "flick_hz": flick_hz,
-            "flick_phase": random.uniform(0, math.pi * 2) if flick_hz > 0 else 0.0,
+            "flick_phase": 0.0,
             "op_mid": op_mid, "op_amp": op_amp,
             "op_period": random.uniform(3.0, 7.0),
             "op_phase": random.uniform(0, math.pi * 2),
@@ -823,13 +809,11 @@ class FloatingWatermark:
         mask = spr[:, :, 3] > 10
         if not mask.any():
             return spr
-        # ✅ كروما-نويس داخل الحرف (خفي)
         cn = rng.uniform(-4.0, 4.0, size=(H, W)).astype(np.float32) * mask
         rgbf = spr[:, :, :3].astype(np.float32)
         rgbf[:, :, 0] = np.clip(rgbf[:, :, 0] + cn * 0.8, 0, 255)
         rgbf[:, :, 2] = np.clip(rgbf[:, :, 2] - cn * 0.8, 0, 255)
         spr[:, :, :3] = rgbf.astype(np.uint8)
-        # ✅ ضوضاء شكل على حواف Alpha
         a8 = spr[:, :, 3]
         k = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
         er = cv2.erode(a8, k, 1).astype(np.float32)
@@ -840,7 +824,6 @@ class FloatingWatermark:
             af = spr[:, :, 3].astype(np.float32)
             af = np.where(band, np.clip(af + edge_noise * 0.5, 0, 255), af)
             spr[:, :, 3] = af.astype(np.uint8)
-        # ✅✅✅ Alpha jitter لكل فريم (يكسر التوحيد الزمني للـ matting) — ±2/255 غير محسوس
         mask2 = (spr[:, :, 3] > 10).astype(np.int16)
         jit = rng.randint(-2, 3, size=(H, W), dtype=np.int16)
         aj = spr[:, :, 3].astype(np.int16) + jit * mask2
@@ -1111,14 +1094,11 @@ class FloatingWatermark:
             lm = lum[y0:y1, x0:x1]
             tm = tex[y0:y1, x0:x1]
             region = frame[y0:y1, x0:x1].astype(np.float32)
-            # 1) كروما-Parity كاملة (خفية)
-            chroma = sub * (PARITY_AMP_TEXT * 1.8) * sgn
+            chroma = sub * (PARITY_AMP_TEXT * 2.0) * sgn
             region[:, :, 0] = np.clip(region[:, :, 0] + chroma * 0.7, 0, 255)
             region[:, :, 2] = np.clip(region[:, :, 2] - chroma * 0.7, 0, 255)
-            # 2) سطوع-Parity مقنع مزدوج
             vmask = np.clip((lm - 70.0) / 60.0, 0.0, 1.0) * np.clip(tm / 10.0, 0.0, 1.0)
             region += (sub * PARITY_AMP_TEXT * sgn * vmask)[:, :, None]
-            # 3) ✅ فقاعات تردد-منخفض ±2 (مبدأ Watermark Vaccine: تخرب ميزات الشبكة بدون رؤية)
             if blob is not None:
                 region += blob[y0:y1, x0:x1][:, :, None]
             frame[y0:y1, x0:x1] = np.clip(region, 0, 255).astype(np.uint8)
@@ -1131,7 +1111,6 @@ class FloatingWatermark:
         out = np.clip(out.astype(np.float32) * 1.18 - blur_s.astype(np.float32) * 0.18,
                       0, 255).astype(np.uint8)
 
-        # ✅✅✅ Spread-Spectrum chroma embedding (ثابت لكل الفريمات = بصمة forensic)
         outf = out.astype(np.float32)
         outf[:, :, 0] = np.clip(outf[:, :, 0] + self._ss_field * 0.9, 0, 255)
         outf[:, :, 2] = np.clip(outf[:, :, 2] - self._ss_field * 0.9, 0, 255)
@@ -1148,11 +1127,10 @@ class FloatingWatermark:
             self._frame_texture = np.abs(blur_small - blur_large)
             self._frame_lum = cv2.blur(gf, (9, 9))
             self._maps_frame = frame_num
-        # ✅ حقل فقاعات منخفض التردد لكل فريم (طور عشوائي)
         brng = np.random.RandomState((frame_num * 7777) % (2**32))
         bl = brng.normal(size=(max(8, self.height // 24), max(8, self.width // 24))).astype(np.float32)
         bl = cv2.resize(bl, (self.width, self.height), interpolation=cv2.INTER_CUBIC)
-        self._blob_field = (bl / (np.std(bl) + 1e-6)) * 2.0
+        self._blob_field = (bl / (np.std(bl) + 1e-6)) * 3.5
 
         rng_af = np.random.RandomState((frame_num * 65537) % (2**32))
         rects = []
@@ -1166,12 +1144,8 @@ class FloatingWatermark:
                 continue
             osh, osw = sprite.shape[:2]
             fade = self._fade_alpha(wm) / max(1e-6, wm.get("base_alpha", 1.0))
-            if wm.get("type") == "flick":
-                m = 1.0 + 0.25 * math.sin(t * wm["flick_hz"] * 2 * math.pi + wm.get("flick_phase", 0))
-                alpha = fade * wm["base_alpha"] * m
-            else:
-                wave = math.sin(2 * math.pi * t / wm["op_period"] + wm["op_phase"])
-                alpha = fade * (wm["op_mid"] + wm["op_amp"] * wave)
+            wave = math.sin(2 * math.pi * t / wm["op_period"] + wm["op_phase"])
+            alpha = fade * (wm["op_mid"] + wm["op_amp"] * wave)
             alpha = max(0.28, min(0.68, alpha))
             alpha *= 1.0 + rng_af.uniform(-0.06, 0.06)
             if wm["y"] < self.top_fade_margin:
@@ -1191,6 +1165,13 @@ class FloatingWatermark:
             sprite = self._adaptive_bind(sprite, self._frame_detail, self._frame_edges,
                                          self._frame_texture, x, y, wm["bind_gain"], wm["bind_amod"])
             sprite = self._apply_edge_camouflage(sprite, self._frame_edges, self._frame_texture, x, y)
+            # ✅✅✅ الهالة المتبقية لكل النصوص: ظل ناعم طبيعي للمشاهد + شبح يبقى بعد الإزالة
+            halo_r, hm_r = self._get_halo(txt, wm["font_size"], bold=False,
+                                          halo_color=18, halo_strength=0.30,
+                                          halo_sigma=5.0, halo_dilate=5)
+            if halo_r is not None:
+                self._blend_sprite(out, halo_r, x - hm_r + 1, y - hm_r + 2,
+                                   min(0.60, alpha * 0.55))
             if wm.get("anchor"):
                 halo, hm = self._get_halo(txt, wm["font_size"], bold=False,
                                           halo_color=30, halo_strength=0.25,
@@ -1202,29 +1183,7 @@ class FloatingWatermark:
             else:
                 self._blend_sprite(out, sprite, x, y, alpha)
             rects.append((int(x), int(y), sw, sh))
-            # ✅✅✅ نسخ الصدى الباهتة: تزرع أشباحاً تبقى بعد الإزالة
-            for (edx, edy, em) in (wm.get("e1"), wm.get("e2")):
-                ea = alpha * em
-                if ea > 0.012:
-                    self._blend_sprite(out, sprite, x + edx, y + edy, ea)
         self._process_vip(out, 1.0 / self.out_fps, frame_num, rects)
-        dt = 1.0 / self.out_fps
-        for g in self.ghosts:
-            g["y"] -= g["vy_ps"] * dt
-            g["age"] += 1
-            gtxt = self.text_variants[g.get("text_idx", 0)]
-            sprite = self._make_sprite(gtxt, g["font_size"], bold=False,
-                                       vary_seed=g.get("vary_seed"))
-            if sprite is None:
-                continue
-            sh = sprite.shape[0]
-            if g["age"] > g["life"] or g["y"] < -sh - 50:
-                continue
-            ga = self._fade_alpha(g)
-            if ga <= 0.004:
-                continue
-            self._blend_sprite(out, sprite, g["x"], g["y"], ga)
-            rects.append((int(g["x"]), int(g["y"]), sprite.shape[1], sh))
         out = self._apply_region_poisons(out, rects, frame_num)
         return out
 
@@ -1408,9 +1367,9 @@ async def worker():
 @app.on_message(filters.command("start"))
 async def start(c, m):
     await m.reply("👋 هلا! 🎬\n\nأرسل فيديو وأضيف الحقوق:\n\n"
-                  "🖋 50 نص + مراسي + أشباح صدى باهتة\n"
+                  "🖋 50 نص نظيف بدون ومضات أو أشباح متحركة\n"
                   "🖼 مصغرة = أول فريم\n"
-                  "🛡️ 8 طبقات حماية خفية (مبنية على أبحاث مضادة للإزالة)\n"
+                  "🛡️ هالات متبقية: الإزالة تترك أشباح حقوق\n"
                   "🖤 Telegram:@vamp1r3s أسود واضح\n"
                   "💾 CRF 20 مضبوط | 📺 عرض سليم | 🚀 سريع")
 
@@ -1438,7 +1397,7 @@ async def status(c, m):
 async def main():
     print("🤖 تشغيل البوت...")
     await app.start()
-    print("✓ البوت شغال | دفاع متعدد الطبقات: أشباح + فقاعات + spread-spectrum + jitter")
+    print("✓ البوت شغال | بدون ومضات/أشباح + هالات متبقية ضد الإزالة")
     asyncio.create_task(worker())
     try:
         from pyrogram import idle
