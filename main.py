@@ -33,12 +33,12 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise ValueError("⚠️ عبّئ المتغيرات")
 
-ENCODE_CRF = 20
+ENCODE_CRF = 18
 ENCODE_PRESET = "superfast"
 STRONG_COUNT = 58
 MICRO_COUNT = 30
-FLICK_COUNT = 0
-GHOST_COUNT = 0
+FLICK_COUNT = 3
+GHOST_COUNT = 2
 MAX_QUEUE = 6
 
 NYQ_AMP = (10.0, 16.0)
