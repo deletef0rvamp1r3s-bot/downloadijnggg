@@ -33,12 +33,12 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise ValueError("⚠️ عبّئ المتغيرات")
 
-ENCODE_CRF = 18
+ENCODE_CRF = 20
 ENCODE_PRESET = "superfast"
-STRONG_COUNT = 58
-MICRO_COUNT = 30
+STRONG_COUNT = 30
 FLICK_COUNT = 3
 GHOST_COUNT = 2
+MICRO_COUNT = 30
 MAX_QUEUE = 6
 
 NYQ_AMP = (10.0, 16.0)
@@ -94,13 +94,19 @@ def probe_video(path):
 
 
 def read_geometry(pr):
-    out = {"w0": 720, "h0": 1280, "sar_str": "1:1", "sar_val": 1.0, "rot": 0, "fps": 30.0, "total": 0, "bitrate": 0}
+    out = {"w0": 720, "h0": 1280, "sar_str": "1:1", "sar_val": 1.0, "rot": 0,
+           "fps": 30.0, "total": 0, "bitrate": 0, "has_audio": False, "duration": 0.0}
     if pr is None:
         return out
     vs = None
     for s in pr.get("streams", []):
         if s.get("codec_type") == "video":
             vs = s; break
+        if s.get("codec_type") == "audio":
+            out["has_audio"] = True
+    for s in pr.get("streams", []):
+        if s.get("codec_type") == "audio":
+            out["has_audio"] = True
     if vs is None:
         return out
     w0 = int(vs.get("width", 720)); h0 = int(vs.get("height", 1280))
@@ -134,12 +140,14 @@ def read_geometry(pr):
         total = int(nb) if nb and nb != "N/A" else 0
     except Exception:
         pass
-    if total <= 0:
-        try:
-            dur = float(pr.get("format", {}).get("duration", 0))
-            total = int(dur * fps) if dur > 0 else 0
-        except Exception:
-            pass
+    dur = 0.0
+    try:
+        dur = float(pr.get("format", {}).get("duration", 0) or 0)
+    except Exception:
+        pass
+    out["duration"] = dur
+    if total <= 0 and dur > 0:
+        total = int(dur * fps)
     br = 0
     try:
         br = int(pr.get("format", {}).get("bit_rate", 0) or 0)
@@ -203,7 +211,8 @@ class PipeEncoder:
         if maxrate: cmd += ["-maxrate", maxrate]
         if bufsize: cmd += ["-bufsize", bufsize]
         if audio_src and os.path.exists(audio_src):
-            cmd += ["-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "128k"]
+            # ✅✅✅ apad: نمدد الصوت صامتاً لين نهاية الفيديو = ما ينقص المقطع أبداً
+            cmd += ["-af", "apad", "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "128k"]
         cmd += ["-movflags", "+faststart", "-shortest", "-y", out]
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -231,13 +240,14 @@ class FloatingWatermark:
     def __init__(self, video_path, output_path, audio_src=None):
         self.video_path = video_path
         self.output_path = output_path
-        self.audio_src = audio_src
         g = read_geometry(probe_video(video_path))
         self.in_geo = g
         self.fps = g["fps"] if g["fps"] > 0 else 30.0
         self.src_bitrate = g["bitrate"]
         self.step = 2 if self.fps >= 50 else 1
         self.out_fps = self.fps / self.step
+        # ✅ صوت فقط إذا موجود فعلاً
+        self.audio_src = audio_src if g["has_audio"] else None
 
         self.dec = subprocess.Popen(
             ["ffmpeg", "-hide_banner", "-loglevel", "error", "-noautorotate",
@@ -280,14 +290,15 @@ class FloatingWatermark:
 
         self.thumb_path = output_path + ".thumb.jpg"
         self._thumb_done = False
-        print(f"✅ معايرة: rot={self.rot_pick} | {self.width}x{self.height} | fps {self.fps:.0f}→{self.out_fps:.0f}")
+        print(f"✅ معايرة: rot={self.rot_pick} | {self.width}x{self.height} | "
+              f"fps {self.fps:.0f}→{self.out_fps:.0f} | صوت={bool(self.audio_src)} | مدة={g['duration']:.0f}s")
 
         br_m = self.src_bitrate / 1_000_000 if self.src_bitrate else 0
         cap_m = max(2.5, min(8.0, br_m * 2.2)) if br_m > 0 else 4.0
         self.maxrate = f"{cap_m:.1f}M"
         self.bufsize = f"{max(4, int(cap_m * 2.5))}M"
 
-        dur_s = (raw_total / self.fps) if raw_total < 10 ** 9 else 600.0
+        dur_s = g["duration"] if g["duration"] > 0 else ((raw_total / self.fps) if raw_total < 10 ** 9 else 600.0)
         need_gb = dur_s * (cap_m / 8.0) * 1.3 / 1024 + 0.2
         if free_gb() < need_gb:
             purge_workspace(max_age_sec=0, force=True)
@@ -296,7 +307,7 @@ class FloatingWatermark:
             raise ValueError(f"❌ القرص ممتلئ: متوفر {free_gb():.1f}GB ومطلوب {need_gb:.1f}GB — أعد النشر")
 
         self.enc = PipeEncoder(self.width, self.height, self.out_fps, output_path,
-                               audio_src, 20, "superfast", self.maxrate, self.bufsize)
+                               self.audio_src, 20, "superfast", self.maxrate, self.bufsize)
         self.text_variants = ["Tel:@vamp1r3s"]
         self.vip_text = "Telegram:@vamp1r3s"
         self.vip_vary = random.randint(1, 10**9)
@@ -359,8 +370,9 @@ class FloatingWatermark:
         self.initialize_watermarks()
         self.micro = []
         self._init_micro()
-        self._init_vip()
         self.ghosts = []
+        self._init_ghosts()
+        self._init_vip()
 
     def _read_exact(self, n):
         buf = self.dec.stdout.read(n)
@@ -644,14 +656,24 @@ class FloatingWatermark:
 
     def _make_watermark(self, wm_type, rid=0):
         anchor = (wm_type == "strong" and random.random() < 0.28)
-        if anchor:
-            font_size = random.randint(self.strong_max_font, max(self.strong_max_font + 2, int(self.strong_max_font * 1.5)))
-        else:
+        if wm_type == "flick":
             font_size = random.randint(self.strong_min_font, self.strong_max_font)
-        base_alpha = 1.0
-        vy_ps = random.uniform(120, 260)
-        life_s = random.uniform(4.5, 8.0)
-        j_amp = random.uniform(0.25, 0.45)
+            base_alpha = random.uniform(0.38, 0.42)
+            vy_ps = random.uniform(220, 360)
+            life_s = random.uniform(4.0, 7.0)
+            flick_hz = random.uniform(0.7, 1.4)
+            j_amp = random.uniform(0.3, 0.5)
+            anchor = False
+        else:
+            if anchor:
+                font_size = random.randint(self.strong_max_font, max(self.strong_max_font + 2, int(self.strong_max_font * 1.5)))
+            else:
+                font_size = random.randint(self.strong_min_font, self.strong_max_font)
+            base_alpha = 1.0
+            vy_ps = random.uniform(120, 260)
+            life_s = random.uniform(4.5, 8.0)
+            flick_hz = 0.0
+            j_amp = random.uniform(0.25, 0.45)
         bind_gain = random.uniform(5.0, 7.5)
         bind_amod = random.uniform(0.32, 0.52)
         prof = random.random()
@@ -684,6 +706,8 @@ class FloatingWatermark:
             "fx_grow_amp": random.uniform(0.06, 0.14),
             "font_size": font_size, "base_alpha": base_alpha,
             "life": life, "age": random.randint(0, fi), "fade_in": fi, "fade_out": fo,
+            "flick_hz": flick_hz,
+            "flick_phase": random.uniform(0, math.pi * 2) if flick_hz > 0 else 0.0,
             "op_mid": op_mid, "op_amp": op_amp,
             "op_period": random.uniform(3.0, 7.0),
             "op_phase": random.uniform(0, math.pi * 2),
@@ -710,7 +734,6 @@ class FloatingWatermark:
             "fx_color_drift_freq": random.uniform(0.06, 0.12),
             "fx_color_drift_phase": random.uniform(0, math.pi * 2),
             "fx_color_drift_amp": random.uniform(6, 11),
-            # ✅✅✅ أسلحة الستايل النهائية:
             "pat_type": random.choice([0, 0, 1, 2]),
             "pat_amp": random.uniform(10.0, 18.0),
             "pat_ang": random.uniform(0.3, 0.9),
@@ -742,14 +765,36 @@ class FloatingWatermark:
             "fade_in": max(6, int(self.out_fps)), "fade_out": max(6, int(self.out_fps)),
         }
 
+    def _make_ghost(self, rid):
+        size = int(self.strong_max_font * random.uniform(1.6, 2.4))
+        max_w = int((self.width * 0.9) / max(10, len(self.strong_text) * 0.62))
+        size = max(14, min(size, max_w))
+        est_w = int(size * len(self.strong_text) * 0.62); est_h = int(size * 1.6)
+        col, row = self._next_cell()
+        cw, ch = self.width / self.grid_cols, self.height / self.grid_rows
+        x = col * cw + cw * random.uniform(0.1, 0.9) - est_w / 2
+        y = row * ch + ch * random.uniform(0.1, 0.9) - est_h / 2
+        x = max(2, min(x, self.width - est_w - 2)); y = max(2, min(y, self.height - est_h - 2))
+        life = max(40, int(random.uniform(6, 10) * self.out_fps))
+        return {"rid": rid, "x": x, "y": y, "vy_ps": random.uniform(60, 120), "font_size": size,
+                "base_alpha": random.uniform(0.020, 0.035), "life": life,
+                "age": random.randint(0, max(1, int(0.5 * self.out_fps))),
+                "fade_in": max(8, int(self.out_fps)), "fade_out": max(8, int(1.5 * self.out_fps)),
+                "text_idx": 0, "vary_seed": random.randint(1, 10**9)}
+
     def initialize_watermarks(self):
         self.watermarks = [self._make_watermark("strong", i) for i in range(STRONG_COUNT)]
+        self.watermarks += [self._make_watermark("flick", 500 + i) for i in range(FLICK_COUNT)]
 
     def _init_micro(self):
         self.micro = [self._make_micro(1000 + i) for i in range(MICRO_COUNT)]
 
+    def _init_ghosts(self):
+        self.ghosts = [self._make_ghost(2000 + i) for i in range(GHOST_COUNT)]
+
     def reset_watermark(self, idx):
-        self.watermarks[idx] = self._make_watermark("strong", idx)
+        old = self.watermarks[idx].get("type", "strong")
+        self.watermarks[idx] = self._make_watermark(old, idx)
 
     def reset_micro(self, idx):
         self.micro[idx] = self._make_micro(1000 + idx)
@@ -818,7 +863,6 @@ class FloatingWatermark:
             2 * math.pi * wm.get("pz_gam_freq", 0.15) * t + wm.get("pz_gam_ph", 0.0))
         alpha = 255.0 * np.power(np.clip(alpha / 255.0, 0.0, 1.0), gj)
 
-        # ✅✅✅ Morph عشوائي لكل فريم (حدود القناع ما تستقر)
         rngm = np.random.RandomState((frame_num * 977 + wm.get("rid", 0)) % (2**32))
         morph_cycle = wm.get("fx_morph_amp", 0.4) * math.sin(2 * math.pi * wm.get("fx_morph_freq", 0.12) * t + ph2)
         morph_cycle += rngm.uniform(-0.3, 0.3)
@@ -859,7 +903,6 @@ class FloatingWatermark:
         lum_mod = 1.0 + lum_flick * math.sin(2 * math.pi * lum_freq * t + ph)
         rgb *= lum_mod
 
-        # ✅✅✅ التعبئة النمطية داخل الحرف (ستايل مقصود = كابوس للـ matting)
         pat_amp = wm.get("pat_amp", 0.0)
         if pat_amp > 0.1:
             yy, xx = np.mgrid[0:H_spr, 0:W_spr].astype(np.float32)
@@ -873,7 +916,6 @@ class FloatingWatermark:
                 wv = np.sign(np.sin(xx * freq)) * np.sign(np.sin(yy * freq))
             rgb = np.clip(rgb + (wv * pat_amp)[:, :, None] * mask[:, :, None], 0, 255)
 
-        # ✅✅✅ انزياح لوني سينمائي (chromatic aberration)
         ca = wm.get("ca_px", 0)
         if ca:
             r0 = rgb[:, :, 0].copy(); b0 = rgb[:, :, 2].copy()
@@ -1050,8 +1092,12 @@ class FloatingWatermark:
             if sprite is None: continue
             osh, osw = sprite.shape[:2]
             fade = self._fade_alpha(wm) / max(1e-6, wm.get("base_alpha", 1.0))
-            wave = math.sin(2 * math.pi * t / wm["op_period"] + wm["op_phase"])
-            alpha = fade * (wm["op_mid"] + wm["op_amp"] * wave)
+            if wm.get("type") == "flick":
+                m = 1.0 + 0.25 * math.sin(t * wm.get("flick_hz", 1.0) * 2 * math.pi + wm.get("flick_phase", 0))
+                alpha = fade * wm["base_alpha"] * m
+            else:
+                wave = math.sin(2 * math.pi * t / wm["op_period"] + wm["op_phase"])
+                alpha = fade * (wm["op_mid"] + wm["op_amp"] * wave)
             alpha = max(0.28, min(0.68, alpha))
             alpha *= 1.0 + rng_af.uniform(-0.10, 0.10)
             if wm["y"] < self.top_fade_margin:
@@ -1074,7 +1120,6 @@ class FloatingWatermark:
                                           halo_color=30, halo_strength=0.22, halo_sigma=3.0, halo_dilate=2)
                 if halo is not None:
                     self._blend_sprite(out, halo, x - hm + 1, y - hm + 2, alpha)
-            # ✅ الظل الاتجاهي (يبقى كشبح بعد الإزالة)
             self._blend_sprite(out, sprite, x + wm.get("sh_dx", 3), y + wm.get("sh_dy", 3),
                                alpha * wm.get("sh_alpha", 0.35))
             if wm.get("blend") == "overlay":
@@ -1083,7 +1128,6 @@ class FloatingWatermark:
                 self._blend_sprite(out, sprite, x, y, alpha)
             rects.append((int(x), int(y), sw, sh))
 
-        # ✅✅✅ طبقة الميكرو-نصوص (تحت عتبة كشف المزيل = تنجو من التنظيف)
         for mi, mw in enumerate(self.micro):
             mw["y"] -= mw["vy_ps"] / self.out_fps
             mw["age"] += 1
@@ -1092,17 +1136,30 @@ class FloatingWatermark:
             mspr = self._make_sprite(self.text_variants[mw["text_idx"]], mw["font_size"],
                                      bold=False, vary_seed=mw["vary_seed"])
             if mspr is None: continue
-            age, life = mw["age"], mw["life"]
-            fi, fo = mw["fade_in"], mw["fade_out"]
-            if age < fi: f = age / max(1, fi)
-            elif age > life - fo: f = max(0.0, (life - age) / max(1, fo))
-            else: f = 1.0
-            malpha = mw["alpha"] * f
-            if malpha <= 0.01: continue
+            ga = self._fade_alpha(mw)
+            malpha = mw["alpha"] * (ga / max(1e-6, mw["alpha"])) if mw.get("base_alpha") is None else ga
+            malpha = ga
+            if malpha <= 0.004: continue
             self._blend_sprite(out, mspr, mw["x"], mw["y"], malpha)
             rects.append((int(mw["x"]), int(mw["y"]), mspr.shape[1], mspr.shape[0]))
 
-        self._process_vip(out, 1.0 / self.out_fps, frame_num, rects)
+        dt = 1.0 / self.out_fps
+        for g in self.ghosts:
+            g["y"] -= g["vy_ps"] * dt
+            g["age"] += 1
+            gtxt = self.text_variants[g.get("text_idx", 0)]
+            gspr = self._make_sprite(gtxt, g["font_size"], bold=False, vary_seed=g.get("vary_seed"))
+            if gspr is None: continue
+            sh = gspr.shape[0]
+            if g["age"] > g["life"] or g["y"] < -sh - 50:
+                continue
+            ga = self._fade_alpha(g)
+            if ga <= 0.004:
+                continue
+            self._blend_sprite(out, gspr, g["x"], g["y"], ga)
+            rects.append((int(g["x"]), int(g["y"]), gspr.shape[1], sh))
+
+        self._process_vip(out, dt, frame_num, rects)
         out = self._apply_region_poisons(out, rects, frame_num)
         return out
 
@@ -1137,6 +1194,10 @@ class FloatingWatermark:
                 progress_cb(n, max(n, self.total_out if self.total_out else n))
         if progress_cb is not None:
             progress_cb(max(n, 1), max(n, 1))
+        # ✅✅✅ حماية من القص الصامت: إذا انقطع الفك قبل وقته = فشل صريح بدل ملف خربان
+        if self.total_out and self.total_out < 10 ** 8 and n < self.total_out - 5:
+            self.enc.close(); self._kill_dec()
+            raise ValueError(f"❌ انقطع فك الفيديو عند فريم {n} من {self.total_out} — الملف المصدر تالف")
         self.enc.close(); self._kill_dec()
         return time.time() - t0
 
@@ -1253,9 +1314,9 @@ async def worker():
 @app.on_message(filters.command("start"))
 async def start(c, m):
     await m.reply("👋 هلا! 🎬\n\nأرسل فيديو وأضيف الحقوق:\n\n"
-                  "🖋 58 نص مسلّح + 30 ميكرو + VIP\n"
-                  "🎨 نقشة/ظل/انزياح لوني = ستايل يقاوم الإزالة\n"
-                  "🖼 مصغرة = أول فريم\n"
+                  "🖋 30 نص + 3 flick + 2 ghosts + 30 ميكرو + VIP\n"
+                  "⏱ مدة كاملة مضمونة (إصلاح قص الصوت)\n"
+                  "🎨 تسليح ستايل ضد الإزالة\n"
                   "🖤 Telegram:@vamp1r3s\n"
                   "💾 CRF 20 | 📺 عرض سليم | 🚀 سريع")
 
@@ -1281,7 +1342,7 @@ async def status(c, m):
 async def main():
     print("🤖 تشغيل البوت...")
     await app.start()
-    print(f"✓ البوت شغال | التسليح النهائي بالستايل | قرص: {free_gb():.1f}GB")
+    print(f"✓ البوت شغال | apad إصلاح المدة | 30/3/2 + ميكرو | قرص: {free_gb():.1f}GB")
     asyncio.create_task(worker())
     try:
         from pyrogram import idle
