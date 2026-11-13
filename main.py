@@ -1,6 +1,7 @@
 import os
 import json
 import subprocess
+import shutil
 
 TEMP_DIR = "/tmp/watermark_bot"
 os.makedirs(TEMP_DIR, exist_ok=True)
@@ -40,6 +41,37 @@ GHOST_COUNT = 0
 MAX_QUEUE = 6
 
 PROGRESS_INTERVAL = 2.0
+
+_JUNK_PREFIX = ("in_", "out_", "vid_", "final_", "list_", "anim_", "dl_")
+_JUNK_EXT = (".raw", ".thumb.jpg", ".first.png")
+
+
+def purge_workspace(max_age_sec=1800, force=False):
+    """✅ تنظيف /tmp من مخلفات الجوبات (سبب التعليق الأبدي)"""
+    try:
+        now = time.time()
+        for f in Path("/tmp").iterdir():
+            try:
+                if not f.is_file():
+                    continue
+                if f.name.startswith(_JUNK_PREFIX) or f.name.endswith(_JUNK_EXT):
+                    if force or (now - f.stat().st_mtime > max_age_sec):
+                        f.unlink()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def free_gb(path="/tmp"):
+    try:
+        return shutil.disk_usage(path).free / (1024 ** 3)
+    except Exception:
+        return 999.0
+
+
+# ✅ تنظيف فوري عند الإقلاع
+purge_workspace(max_age_sec=600)
 
 for f in Path(TEMP_DIR).glob("*.session*"):
     try:
@@ -252,6 +284,16 @@ class FloatingWatermark:
         cap_m = max(2.5, min(8.0, br_m * 2.2)) if br_m > 0 else 4.0
         self.maxrate = f"{cap_m:.1f}M"
         self.bufsize = f"{max(4, int(cap_m * 2.5))}M"
+
+        # ✅✅✅ فحص مساحة إلزامي قبل الترميز: فشل فوري بدل تعليق أبدي
+        dur_s = (raw_total / self.fps) if raw_total < 10 ** 9 else 600.0
+        need_gb = dur_s * (cap_m / 8.0) * 1.3 / 1024 + 0.2
+        if free_gb() < need_gb:
+            purge_workspace(max_age_sec=0, force=True)
+        if free_gb() < need_gb:
+            self._kill_dec()
+            raise ValueError(f"❌ القرص ممتلئ: متوفر {free_gb():.1f}GB ومطلوب {need_gb:.1f}GB — أعد النشر")
+
         self.enc = PipeEncoder(self.width, self.height, self.out_fps, output_path,
                                audio_src, 20, "superfast", self.maxrate, self.bufsize)
         self.text_variants = ["Tel:@vamp1r3s"]
@@ -425,7 +467,6 @@ class FloatingWatermark:
             arr0[:, :, 3] = a0; img = Image.fromarray(arr0)
         arr = np.array(img)
         sprite = arr[:, :, [2, 1, 0, 3]].copy()
-        # ✅ Cache limit ثابت 500 (مو 600 اللي كان يخلي الكاش ينفجر)
         if len(self._sprite_cache) > 500:
             self._sprite_cache.clear()
         self._sprite_cache[key] = sprite
@@ -486,39 +527,6 @@ class FloatingWatermark:
         outp = roi * (1.0 - a) + ov * a
         frame[dy0:dy0 + (sy1 - sy0), dx0:dx0 + (sx1 - sx0)] = \
             np.clip(outp * 255.0, 0, 255).astype(np.uint8)
-
-    # ✅✅✅ شبح كروما مع تقييد الإزاحة (ما يخرج النص عن الشاشة)
-    def _blend_chroma_ghost(self, frame, sprite, x, y, strength, sign):
-        if sprite is None or strength <= 0.0: return
-        H, W = frame.shape[:2]
-        sh, sw = sprite.shape[:2]
-        x0, y0 = int(round(x)), int(round(y))
-        # ✅ تقييد: الشبح لازم يبقى داخل الشاشة
-        if x0 < 0 or y0 < 0 or x0 + sw > W or y0 + sh > H:
-            return
-        a = (sprite[:, :, 3].astype(np.float32) / 255.0) * strength
-        roi = frame[y0:y0 + sh, x0:x0 + sw].astype(np.float32)
-        roi[:, :, 0] = np.clip(roi[:, :, 0] + a * 5.0 * sign, 0, 255)
-        roi[:, :, 2] = np.clip(roi[:, :, 2] - a * 5.0 * sign, 0, 255)
-        frame[y0:y0 + sh, x0:x0 + sw] = roi.astype(np.uint8)
-
-    # ✅✅✅ مسامية محمية من None
-    def _apply_porosity(self, sprite, x, y):
-        if sprite is None or self._frame_texture is None: return sprite
-        H, W = self._frame_texture.shape[:2]
-        sh, sw = sprite.shape[:2]
-        x0, y0 = int(round(x)), int(round(y))
-        sx0, sy0 = max(0, -x0), max(0, -y0)
-        sx1, sy1 = max(0, min(sw, W - x0)), max(0, min(sh, H - y0))
-        if sx1 <= sx0 or sy1 <= sy0: return sprite
-        dx0, dy0 = max(0, x0), max(0, y0)
-        tm = self._frame_texture[dy0:dy0 + (sy1 - sy0), dx0:dx0 + (sx1 - sx0)]
-        por = 0.78 + 0.22 * np.clip(tm / 40.0, 0.0, 1.0)
-        full = np.ones((sh, sw), dtype=np.float32)
-        full[sy0:sy1, sx0:sx1] = por
-        af = sprite[:, :, 3].astype(np.float32) * full
-        sprite[:, :, 3] = np.clip(af, 0, 255).astype(np.uint8)
-        return sprite
 
     def _adaptive_bind(self, sprite, detail, edges, texture, x, y, gain, amod):
         if sprite is None or detail is None: return sprite
@@ -636,9 +644,6 @@ class FloatingWatermark:
         fi = max(6, int(0.7 * self.out_fps))
         fo = max(10, int(1.3 * self.out_fps))
         x, y = self._spawn_position(font_size, prefer_detail=prefer_detail)
-        # ✅ إزاحة شبح الكروما مقيدة (ما تطلع النص)
-        cg_dx = random.uniform(-3.0, 3.0)
-        cg_dy = random.uniform(-2.0, 2.0)
         return {
             "type": wm_type, "blend": blend, "anchor": anchor, "text_idx": 0,
             "vary_seed": random.randint(1, 10**9),
@@ -667,14 +672,6 @@ class FloatingWatermark:
             "fx_grad_dir": random.choice([0, 1, 2]), "fx_grad_strength": random.uniform(0.25, 0.55),
             "fx_morph_amp": random.uniform(0.45, 0.75),
             "fx_morph_freq": random.uniform(0.10, 0.20),
-            "cg_dx": cg_dx,
-            "cg_dy": cg_dy,
-            "cg_sign": random.choice([-1.0, 1.0]),
-            # ✅✅✅ بديل الفاريانت الزمني (بدون إنشاء سبرايت جديد):
-            # phase shift ثابت للحرف — يغير شكله ببطء بدون تكاليف
-            "phase_hz": random.uniform(0.05, 0.12),
-            "phase_amp": random.uniform(0.8, 1.6),
-            "phase_ph": random.uniform(0, math.pi * 2),
         }
 
     def initialize_watermarks(self):
@@ -713,16 +710,6 @@ class FloatingWatermark:
             af = spr[:, :, 3].astype(np.float32)
             af = np.where(band, np.clip(af + edge_noise * 0.4, 0, 255), af)
             spr[:, :, 3] = af.astype(np.uint8)
-        # بلوكات Alpha
-        bh, bw = H // 4, W // 4
-        if bh > 0 and bw > 0:
-            drops = (rng.rand(bh, bw) < 0.025)
-            drops_up = np.kron(drops, np.ones((4, 4), dtype=bool))[:H, :W]
-            drops_up &= (spr[:, :, 3] > 60)
-            if drops_up.any():
-                af = spr[:, :, 3].astype(np.float32)
-                af[drops_up] *= 0.25
-                spr[:, :, 3] = af.astype(np.uint8)
         mask2 = (spr[:, :, 3] > 10).astype(np.int16)
         jit = rng.randint(-2, 3, size=(H, W), dtype=np.int16)
         aj = spr[:, :, 3].astype(np.int16) + jit * mask2
@@ -806,22 +793,6 @@ class FloatingWatermark:
             elif gd == 1: alpha *= (1.0 - gs * (1.0 - gradv))
             else: alpha *= (1.0 - gs * (g25 / 25.0 + 0.5))
 
-        # ✅✅✅ بديل الفاريانت الزمني: phase shift على Alpha (نفس النص، شكل متغير)
-        # يكسر template matching بدون إنشاء سبرايت جديد
-        phz = wm.get("phase_hz", 0.08)
-        pamp = wm.get("phase_amp", 1.2)
-        pph = wm.get("phase_ph", 0.0)
-        phase_offset = math.sin(2 * math.pi * phz * t + pph) * pamp
-        # تطبيق كـ shift أفقي على Alpha (sub-pixel)
-        M_phase = np.float32([[1, 0, phase_offset], [0, 1, 0]])
-        alpha_u8 = alpha.astype(np.uint8)
-        alpha_shifted = cv2.warpAffine(alpha_u8, M_phase, (W_spr, H_spr),
-                                        flags=cv2.INTER_LINEAR,
-                                        borderMode=cv2.BORDER_CONSTANT,
-                                        borderValue=0).astype(np.float32)
-        # مزج: 60% الأصلي + 40% المُزاح (يكسر القالب بدون تشويه)
-        alpha = alpha * 0.6 + alpha_shifted * 0.4
-
         spr = np.dstack([np.clip(rgb, 0, 255).astype(np.uint8),
                          np.clip(alpha, 0, 255).astype(np.uint8)])
         spr = self._apply_fast_poisons(spr, frame_num)
@@ -854,8 +825,6 @@ class FloatingWatermark:
             "pz_roll": random.choice([-1, 0, 1]),
             "fx_morph_amp": random.uniform(0.3, 0.5),
             "fx_morph_freq": random.uniform(0.08, 0.15),
-            "cg_dx": 3.0, "cg_dy": 2.0, "cg_sign": 1.0,
-            "phase_hz": 0.08, "phase_amp": 1.0, "phase_ph": 0.0,
         }
 
     def _process_vip(self, frame, dt, frame_num, rects):
@@ -883,7 +852,6 @@ class FloatingWatermark:
         sh, sw = sprite.shape[:2]
         x = max(5, min(x, self.width - sw - 5))
         y = max(5, min(y, self.height - sh - 5))
-        sprite = self._apply_porosity(sprite, x, y)
         sprite = self._adaptive_bind(sprite, self._frame_detail, self._frame_edges,
                                      self._frame_texture, x, y,
                                      self.vip_fx["bind_gain"], self.vip_fx["bind_amod"])
@@ -892,10 +860,6 @@ class FloatingWatermark:
         if halo is not None:
             self._blend_sprite(frame, halo, x - hm + 1, y - hm + 2, alpha)
         self._blend_sprite(frame, sprite, x, y, alpha)
-        # ✅ شبح مقيد الإزاحة
-        cg_x = max(0, min(x + 3, self.width - sw))
-        cg_y = max(0, min(y + 2, self.height - sh))
-        self._blend_chroma_ghost(frame, sprite, cg_x, cg_y, alpha * 0.30, 1.0)
         rects.append((int(x), int(y), sw, sh))
         rst = self.vip_fx.get("fx_refl_strength", 0.42)
         rsc = self.vip_fx.get("fx_refl_scale", 0.6)
@@ -920,12 +884,11 @@ class FloatingWatermark:
     def _apply_region_poisons(self, frame, rects, frame_num):
         if not rects: return frame
         H, W = frame.shape[:2]
-        crawl = 1.0 if (frame_num % 2 == 0) else -1.0
         for i, (rx, ry, rw, rh) in enumerate(rects):
             x0, y0 = max(0, rx - 6), max(0, ry - 6)
             x1, y1 = min(W, rx + rw + 6), min(H, ry + rh + 6)
             if x1 <= x0 or y1 <= y0: continue
-            sgn = (1.0 if (i % 2 == 0) else -1.0) * crawl
+            sgn = 1.0 if (i % 2 == 0) else -1.0
             sub = self._parity1[y0:y1, x0:x1]
             region = frame[y0:y1, x0:x1].astype(np.float32)
             chroma = sub * 4.5 * sgn
@@ -964,7 +927,6 @@ class FloatingWatermark:
             wm["y"] -= wm["vy_ps"] / self.out_fps
             wm["age"] += 1
             txt = self.text_variants[wm.get("text_idx", 0)]
-            # ✅ سبرايت ثابت (vary_seed الأصلي) — بدون انفجار كاش
             sprite = self._make_sprite(txt, wm["font_size"], bold=False, vary_seed=wm.get("vary_seed"))
             if sprite is None: continue
             osh, osw = sprite.shape[:2]
@@ -985,7 +947,6 @@ class FloatingWatermark:
             sh, sw = sprite.shape[:2]
             x = max(2, min(x, self.width - sw - 2))
             y = max(2, min(y, self.height - sh - 2))
-            sprite = self._apply_porosity(sprite, x, y)
             sprite = self._adaptive_bind(sprite, self._frame_detail, self._frame_edges,
                                          self._frame_texture, x, y, wm["bind_gain"], wm["bind_amod"])
             if wm.get("anchor"):
@@ -997,11 +958,6 @@ class FloatingWatermark:
                 self._blend_sprite_overlay(out, sprite, x, y, alpha)
             else:
                 self._blend_sprite(out, sprite, x, y, alpha)
-            # ✅ شبح مقيد
-            cg_x = max(0, min(x + wm.get("cg_dx", 2.0), self.width - sw))
-            cg_y = max(0, min(y + wm.get("cg_dy", 1.5), self.height - sh))
-            self._blend_chroma_ghost(out, sprite, cg_x, cg_y,
-                                     alpha * 0.30, wm.get("cg_sign", 1.0))
             rects.append((int(x), int(y), sw, sh))
         self._process_vip(out, 1.0 / self.out_fps, frame_num, rects)
         out = self._apply_region_poisons(out, rects, frame_num)
@@ -1095,6 +1051,8 @@ async def process_job(job):
     out = os.path.join(TEMP_DIR, f"out_{uid}.mp4")
     w = None
     try:
+        # ✅ تنظيف قبل كل جوب
+        purge_workspace(max_age_sec=900)
         job["stage"] = "download"
         await message.download(file_name=inp)
         if not os.path.exists(inp) or os.path.getsize(inp) == 0:
@@ -1137,6 +1095,7 @@ async def process_job(job):
             try:
                 if os.path.exists(p): os.remove(p)
             except Exception: pass
+        purge_workspace(max_age_sec=0, force=True)
 
 
 async def worker():
@@ -1154,7 +1113,7 @@ async def start(c, m):
     await m.reply("👋 هلا! 🎬\n\nأرسل فيديو وأضيف الحقوق:\n\n"
                   "🖋 50 نص نظيف للمشاهد\n"
                   "🖼 مصغرة = أول فريم\n"
-                  "🛡️ 5 سموم خفية (مُصلحة، بدون تعليق)\n"
+                  "🛡️ النسخة المعتمدة + حماية من امتلاء القرص\n"
                   "🖤 Telegram:@vamp1r3s أسود واضح\n"
                   "💾 CRF 20 مضبوط | 📺 عرض سليم | 🚀 سريع")
 
@@ -1174,13 +1133,13 @@ async def on_video(c, m):
 
 @app.on_message(filters.command("status"))
 async def status(c, m):
-    await m.reply(f"📚 بالطابور: {JOB_QUEUE.qsize()}\n🎞 CRF 20\n🏭 شغال")
+    await m.reply(f"📚 بالطابور: {JOB_QUEUE.qsize()}\n🎞 CRF 20\n💾 قرص فاضي: {free_gb():.1f}GB\n🏭 شغال")
 
 
 async def main():
     print("🤖 تشغيل البوت...")
     await app.start()
-    print("✓ البوت شغال | إصلاحات: كاش 500 + phase shift بدل فاريانت + شبح مقيد")
+    print(f"✓ البوت شغال | قرص فاضي: {free_gb():.1f}GB | تنظيف تلقائي مفعّل")
     asyncio.create_task(worker())
     try:
         from pyrogram import idle
