@@ -93,6 +93,14 @@ def probe_video(path):
     return None
 
 
+def _parse_fr(fr):
+    try:
+        n, d = str(fr).split("/")
+        return float(n) / float(d) if float(d) else 0.0
+    except Exception:
+        return 0.0
+
+
 def read_geometry(pr):
     out = {"w0": 720, "h0": 1280, "sar_str": "1:1", "sar_val": 1.0, "rot": 0,
            "fps": 30.0, "total": 0, "bitrate": 0, "has_audio": False, "duration": 0.0}
@@ -102,8 +110,6 @@ def read_geometry(pr):
     for s in pr.get("streams", []):
         if s.get("codec_type") == "video":
             vs = s; break
-        if s.get("codec_type") == "audio":
-            out["has_audio"] = True
     for s in pr.get("streams", []):
         if s.get("codec_type") == "audio":
             out["has_audio"] = True
@@ -126,28 +132,29 @@ def read_geometry(pr):
             except Exception:
                 pass
             break
-    fps = 30.0
-    rf = vs.get("r_frame_rate", "")
-    if "/" in str(rf):
-        try:
-            n, d = rf.split("/")
-            fps = float(n) / float(d) if float(d) else 30.0
-        except Exception:
-            pass
-    total = 0
-    nb = vs.get("nb_frames")
-    try:
-        total = int(nb) if nb and nb != "N/A" else 0
-    except Exception:
-        pass
     dur = 0.0
     try:
         dur = float(pr.get("format", {}).get("duration", 0) or 0)
     except Exception:
         pass
     out["duration"] = dur
-    if total <= 0 and dur > 0:
-        total = int(dur * fps)
+    nb = 0
+    try:
+        nb = int(vs.get("nb_frames", 0) or 0)
+    except Exception:
+        nb = 0
+    if nb <= 0 and dur > 0:
+        nb = int(dur * (_parse_fr(vs.get("avg_frame_rate", "")) or _parse_fr(vs.get("r_frame_rate", "")) or 30.0))
+    # ✅✅✅ fps موثوق: نتحقق من (nb_frames ÷ duration) قبل ما نصدق r_frame_rate
+    r_fps = _parse_fr(vs.get("r_frame_rate", ""))
+    a_fps = _parse_fr(vs.get("avg_frame_rate", ""))
+    fps = a_fps if 8 <= a_fps <= 240 else (r_fps if 8 <= r_fps <= 240 else 30.0)
+    if dur > 1.0 and nb > 0:
+        fps_nb = nb / dur
+        if 8 <= fps_nb <= 240 and abs(fps_nb - fps) > fps * 0.25:
+            fps = fps_nb
+    fps = min(max(fps, 10.0), 60.0)
+    total = nb if nb > 0 else int(dur * fps)
     br = 0
     try:
         br = int(pr.get("format", {}).get("bit_rate", 0) or 0)
@@ -211,7 +218,6 @@ class PipeEncoder:
         if maxrate: cmd += ["-maxrate", maxrate]
         if bufsize: cmd += ["-bufsize", bufsize]
         if audio_src and os.path.exists(audio_src):
-            # ✅✅✅ apad: نمدد الصوت صامتاً لين نهاية الفيديو = ما ينقص المقطع أبداً
             cmd += ["-af", "apad", "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "128k"]
         cmd += ["-movflags", "+faststart", "-shortest", "-y", out]
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
@@ -246,7 +252,6 @@ class FloatingWatermark:
         self.src_bitrate = g["bitrate"]
         self.step = 2 if self.fps >= 50 else 1
         self.out_fps = self.fps / self.step
-        # ✅ صوت فقط إذا موجود فعلاً
         self.audio_src = audio_src if g["has_audio"] else None
 
         self.dec = subprocess.Popen(
@@ -285,20 +290,24 @@ class FloatingWatermark:
         self.width, self.height = dims[0] + dims[0] % 2, dims[1] + dims[1] % 2
         self.in_png_dims = in_dims
 
-        raw_total = g["total"] if g["total"] > 0 else 10 ** 9
-        self.total_out = max(1, raw_total // self.step) if raw_total < 10 ** 9 else 0
+        # ✅✅✅ المدة الرسمية من duration × out_fps (ما تعتمد على nb_frames وحده)
+        if g["duration"] > 1.0:
+            self.total_out = max(1, int(round(g["duration"] * self.out_fps)))
+        else:
+            raw_total = g["total"] if g["total"] > 0 else 10 ** 9
+            self.total_out = max(1, raw_total // self.step) if raw_total < 10 ** 9 else 0
 
         self.thumb_path = output_path + ".thumb.jpg"
         self._thumb_done = False
         print(f"✅ معايرة: rot={self.rot_pick} | {self.width}x{self.height} | "
-              f"fps {self.fps:.0f}→{self.out_fps:.0f} | صوت={bool(self.audio_src)} | مدة={g['duration']:.0f}s")
+              f"fps موثوق={self.fps:.2f}→خرج={self.out_fps:.2f} | مدة={g['duration']:.1f}s | فريمات={self.total_out}")
 
         br_m = self.src_bitrate / 1_000_000 if self.src_bitrate else 0
         cap_m = max(2.5, min(8.0, br_m * 2.2)) if br_m > 0 else 4.0
         self.maxrate = f"{cap_m:.1f}M"
         self.bufsize = f"{max(4, int(cap_m * 2.5))}M"
 
-        dur_s = g["duration"] if g["duration"] > 0 else ((raw_total / self.fps) if raw_total < 10 ** 9 else 600.0)
+        dur_s = g["duration"] if g["duration"] > 0 else (self.total_out / self.out_fps)
         need_gb = dur_s * (cap_m / 8.0) * 1.3 / 1024 + 0.2
         if free_gb() < need_gb:
             purge_workspace(max_age_sec=0, force=True)
@@ -756,11 +765,12 @@ class FloatingWatermark:
         x = max(2, min(x, self.width - est_w - 2))
         y = max(2, min(y, self.height - est_h - 2))
         life = max(60, int(random.uniform(9, 14) * self.out_fps))
+        al = random.uniform(0.20, 0.30)
         return {
             "rid": rid, "text_idx": 0, "font_size": fs,
             "vary_seed": random.randint(1, 10**9),
             "x": x, "y": y, "vy_ps": random.uniform(15, 50),
-            "alpha": random.uniform(0.20, 0.30),
+            "base_alpha": al,
             "life": life, "age": random.randint(0, life // 2),
             "fade_in": max(6, int(self.out_fps)), "fade_out": max(6, int(self.out_fps)),
         }
@@ -1136,9 +1146,7 @@ class FloatingWatermark:
             mspr = self._make_sprite(self.text_variants[mw["text_idx"]], mw["font_size"],
                                      bold=False, vary_seed=mw["vary_seed"])
             if mspr is None: continue
-            ga = self._fade_alpha(mw)
-            malpha = mw["alpha"] * (ga / max(1e-6, mw["alpha"])) if mw.get("base_alpha") is None else ga
-            malpha = ga
+            malpha = self._fade_alpha(mw)
             if malpha <= 0.004: continue
             self._blend_sprite(out, mspr, mw["x"], mw["y"], malpha)
             rects.append((int(mw["x"]), int(mw["y"]), mspr.shape[1], mspr.shape[0]))
@@ -1194,10 +1202,9 @@ class FloatingWatermark:
                 progress_cb(n, max(n, self.total_out if self.total_out else n))
         if progress_cb is not None:
             progress_cb(max(n, 1), max(n, 1))
-        # ✅✅✅ حماية من القص الصامت: إذا انقطع الفك قبل وقته = فشل صريح بدل ملف خربان
-        if self.total_out and self.total_out < 10 ** 8 and n < self.total_out - 5:
+        if self.total_out and n < int(self.total_out * 0.95):
             self.enc.close(); self._kill_dec()
-            raise ValueError(f"❌ انقطع فك الفيديو عند فريم {n} من {self.total_out} — الملف المصدر تالف")
+            raise ValueError(f"❌ انقطع الفك عند فريم {n} من {self.total_out} — المصدر تالف")
         self.enc.close(); self._kill_dec()
         return time.time() - t0
 
@@ -1315,7 +1322,7 @@ async def worker():
 async def start(c, m):
     await m.reply("👋 هلا! 🎬\n\nأرسل فيديو وأضيف الحقوق:\n\n"
                   "🖋 30 نص + 3 flick + 2 ghosts + 30 ميكرو + VIP\n"
-                  "⏱ مدة كاملة مضمونة (إصلاح قص الصوت)\n"
+                  "⏱ مدة كاملة مضمونة (تحقق مزدوج من fps)\n"
                   "🎨 تسليح ستايل ضد الإزالة\n"
                   "🖤 Telegram:@vamp1r3s\n"
                   "💾 CRF 20 | 📺 عرض سليم | 🚀 سريع")
@@ -1342,7 +1349,7 @@ async def status(c, m):
 async def main():
     print("🤖 تشغيل البوت...")
     await app.start()
-    print(f"✓ البوت شغال | apad إصلاح المدة | 30/3/2 + ميكرو | قرص: {free_gb():.1f}GB")
+    print(f"✓ البوت شغال | fps موثوق (nb÷dur) | مدة مضمونة | قرص: {free_gb():.1f}GB")
     asyncio.create_task(worker())
     try:
         from pyrogram import idle
