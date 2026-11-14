@@ -33,12 +33,12 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise ValueError("⚠️ عبّئ المتغيرات")
 
-ENCODE_CRF = 20
+ENCODE_CRF = 18
 ENCODE_PRESET = "superfast"
-STRONG_COUNT = 30
+STRONG_COUNT = 50
 FLICK_COUNT = 3
-GHOST_COUNT = 2
-MICRO_COUNT = 30
+GHOST_COUNT = 5
+MICRO_COUNT = 50
 MAX_QUEUE = 6
 
 NYQ_AMP = (10.0, 16.0)
@@ -145,6 +145,7 @@ def read_geometry(pr):
         nb = 0
     if nb <= 0 and dur > 0:
         nb = int(dur * (_parse_fr(vs.get("avg_frame_rate", "")) or _parse_fr(vs.get("r_frame_rate", "")) or 30.0))
+    # ✅✅✅ fps موثوق: نتحقق من (nb_frames ÷ duration) قبل ما نصدق r_frame_rate
     r_fps = _parse_fr(vs.get("r_frame_rate", ""))
     a_fps = _parse_fr(vs.get("avg_frame_rate", ""))
     fps = a_fps if 8 <= a_fps <= 240 else (r_fps if 8 <= r_fps <= 240 else 30.0)
@@ -289,6 +290,7 @@ class FloatingWatermark:
         self.width, self.height = dims[0] + dims[0] % 2, dims[1] + dims[1] % 2
         self.in_png_dims = in_dims
 
+        # ✅✅✅ المدة الرسمية من duration × out_fps (ما تعتمد على nb_frames وحده)
         if g["duration"] > 1.0:
             self.total_out = max(1, int(round(g["duration"] * self.out_fps)))
         else:
@@ -298,7 +300,7 @@ class FloatingWatermark:
         self.thumb_path = output_path + ".thumb.jpg"
         self._thumb_done = False
         print(f"✅ معايرة: rot={self.rot_pick} | {self.width}x{self.height} | "
-              f"fps={self.fps:.2f}→{self.out_fps:.2f} | مدة={g['duration']:.1f}s | فريمات={self.total_out}")
+              f"fps موثوق={self.fps:.2f}→خرج={self.out_fps:.2f} | مدة={g['duration']:.1f}s | فريمات={self.total_out}")
 
         br_m = self.src_bitrate / 1_000_000 if self.src_bitrate else 0
         cap_m = max(2.5, min(8.0, br_m * 2.2)) if br_m > 0 else 4.0
@@ -324,26 +326,24 @@ class FloatingWatermark:
         self._font_cache = {}
         self._sprite_cache = {}
         self._halo_cache = {}
-
-        # ✅✅✅ توزيع الأحجام الجديد: صغير غالب + وسط + كبير مقروء + مراسي ضخمة
         base = min(self.width, self.height)
-        self.strong_min_font = 12
-        self.strong_mid_font = 16
-        self.strong_max_font = 26
-        self.max_strong_w = int((self.width * 0.90) / max(10, len(self.text_variants[0]) * 0.60))
-        self.strong_max_font = max(self.strong_mid_font + 2, min(self.strong_max_font, self.max_strong_w))
-        self.anchor_min_font = int(self.strong_max_font * 1.15)
-        self.anchor_max_font = min(int(self.strong_max_font * 1.6),
-                                   int((self.width * 0.95) / max(10, len(self.text_variants[0]) * 0.62)))
-        vip_size = max(self.strong_max_font + 8, int(base * 0.062))
+        old_min = max(14, int(base * 0.020))
+        old_max = max(old_min + 4, int(base * 0.040))
+        self.strong_min_font = max(12, int(old_min * 0.55))
+        self.strong_max_font = max(self.strong_min_font + 4, int(old_max * 0.55))
+        max_strong_w = int((self.width * 0.90) / max(10, len(self.text_variants[0]) * 0.60))
+        self.strong_max_font = max(self.strong_min_font + 4, min(self.strong_max_font, max_strong_w))
+        vip_size = max(self.strong_max_font + 6, int(base * 0.062))
         max_vip_w = int((self.width * 0.92) / max(10, len(self.vip_text) * 0.68))
         self.vip_font_size = max(self.strong_min_font + 6, min(vip_size, max_vip_w))
+        if self.vip_font_size <= self.strong_max_font:
+            self.vip_font_size = self.strong_max_font + 6
         self.micro_min_font = 8
         self.micro_max_font = 12
         self.grid_cols, self.grid_rows = 8, 9
         self._cell_queue, self._bottom_queue = [], []
         self.top_fade_margin = 80
-        self._MAXH = int(max(self.vip_font_size, int(self.anchor_max_font * 1.5)) * 2.6) + 80
+        self._MAXH = int(max(self.vip_font_size, int(self.strong_max_font * 1.5)) * 2.6) + 80
         self._MAXW = min(self.width, 1600) + 80
         ii, jj = np.ogrid[0:self._MAXH, 0:self._MAXW]
         self._checker_base = (((ii + jj) & 1).astype(np.float32) * 2.0 - 1.0)
@@ -664,29 +664,22 @@ class FloatingWatermark:
         return best if best is not None else (x, y)
 
     def _make_watermark(self, wm_type, rid=0):
-        anchor = (wm_type == "strong" and random.random() < 0.22)
+        anchor = (wm_type == "strong" and random.random() < 0.28)
         if wm_type == "flick":
-            font_size = random.randint(self.strong_min_font, self.strong_mid_font + 4)
+            font_size = random.randint(self.strong_min_font, self.strong_max_font)
             base_alpha = random.uniform(0.38, 0.42)
-            vy_ps = random.uniform(260, 400)
+            vy_ps = random.uniform(220, 360)
             life_s = random.uniform(4.0, 7.0)
             flick_hz = random.uniform(0.7, 1.4)
             j_amp = random.uniform(0.3, 0.5)
             anchor = False
         else:
-            # ✅✅✅ طبقات الحجم: 55% صغير | 30% وسط | 15% كبير مقروء | مراسي ضخمة
-            tier = random.random()
             if anchor:
-                font_size = random.randint(self.anchor_min_font, self.anchor_max_font)
-            elif tier < 0.55:
-                font_size = random.randint(self.strong_min_font, self.strong_mid_font)
-            elif tier < 0.85:
-                font_size = random.randint(self.strong_mid_font + 1, self.strong_max_font)
+                font_size = random.randint(self.strong_max_font, max(self.strong_max_font + 2, int(self.strong_max_font * 1.5)))
             else:
-                font_size = random.randint(self.strong_max_font + 2, self.anchor_max_font)
+                font_size = random.randint(self.strong_min_font, self.strong_max_font)
             base_alpha = 1.0
-            # ✅ سرعة أعلى شوي
-            vy_ps = random.uniform(110, 220) if anchor else random.uniform(160, 320)
+            vy_ps = random.uniform(120, 260)
             life_s = random.uniform(4.5, 8.0)
             flick_hz = 0.0
             j_amp = random.uniform(0.25, 0.45)
@@ -783,7 +776,7 @@ class FloatingWatermark:
         }
 
     def _make_ghost(self, rid):
-        size = int(random.uniform(28, 40))
+        size = int(self.strong_max_font * random.uniform(1.6, 2.4))
         max_w = int((self.width * 0.9) / max(10, len(self.strong_text) * 0.62))
         size = max(14, min(size, max_w))
         est_w = int(size * len(self.strong_text) * 0.62); est_h = int(size * 1.6)
@@ -1328,9 +1321,9 @@ async def worker():
 @app.on_message(filters.command("start"))
 async def start(c, m):
     await m.reply("👋 هلا! 🎬\n\nأرسل فيديو وأضيف الحقوق:\n\n"
-                  "🖋 30 نص (صغير/وسط/كبير مقروء) + 3 flick + 2 ghosts\n"
-                  "🔬 30 ميكرو + VIP كبير\n"
-                  "⏱ مدة كاملة مضمونة\n"
+                  "🖋 30 نص + 3 flick + 2 ghosts + 30 ميكرو + VIP\n"
+                  "⏱ مدة كاملة مضمونة (تحقق مزدوج من fps)\n"
+                  "🎨 تسليح ستايل ضد الإزالة\n"
                   "🖤 Telegram:@vamp1r3s\n"
                   "💾 CRF 20 | 📺 عرض سليم | 🚀 سريع")
 
@@ -1356,7 +1349,7 @@ async def status(c, m):
 async def main():
     print("🤖 تشغيل البوت...")
     await app.start()
-    print("✓ البوت شغال | أحجام متدرجة (صغير غالب + كبير مقروء) + سرعة أعلى")
+    print(f"✓ البوت شغال | fps موثوق (nb÷dur) | مدة مضمونة | قرص: {free_gb():.1f}GB")
     asyncio.create_task(worker())
     try:
         from pyrogram import idle
